@@ -1,0 +1,17 @@
+[package]
+name = "bnauth-core"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "BNAuth domain model, manual import and Battle.net TOTP"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1.8"
+hmac = "=0.12.1"
+sha1 = "=0.10.6"
+
+[dev-dependencies]
+serde_json = "1"

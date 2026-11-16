@@ -1,0 +1,14 @@
+# Local development documents and work archives
+/.Doc/
+/.self/
+
+# Build caches, tools and distribution output
+/.build/
+/target/
+/dist/
+/BNAuth.exe
+/.tools/
+
+# Authenticator data and interrupted storage transactions
+*.bnauth
+.BNAuth.bnauth.*

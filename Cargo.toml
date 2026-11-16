@@ -1,0 +1,36 @@
+[package]
+name = "bnauth-desktop"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "BNAuth Windows authenticator manager — B2 local import, OTP and durable storage"
+
+[workspace]
+members = [".", "crates/core", "crates/application", "crates/adapters"]
+resolver = "3"
+
+[[bin]]
+name = "BNAuth"
+path = "src/main.rs"
+
+[dependencies]
+bnauth-core = { path = "crates/core" }
+bnauth-app = { path = "crates/application" }
+bnauth-adapters = { path = "crates/adapters" }
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1.8"
+eframe = { version = "=0.37.0", default-features = false, features = ["glow", "clipboard", "accesskit", "links"] }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }

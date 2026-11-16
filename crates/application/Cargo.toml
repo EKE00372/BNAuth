@@ -1,0 +1,8 @@
+[package]
+name = "bnauth-app"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+bnauth-core = { path = "../core" }
