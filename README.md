@@ -1,86 +1,78 @@
 # BNAuth
 
-Windows 戰網驗證器管理工具。執行檔為 `BNAuth.exe`，以 Rust＋egui／eframe 獨立實作，產品代碼採 MIT 授權。
+BNAuth 是 Windows 戰網驗證器管理工具，以 Rust 與 egui／eframe 開發。可在本機管理驗證器、產生八位驗證碼，並將資料保存於程式所在目錄。
 
-**目前開發到 B2：40／74位手動匯入、八位驗證碼、共用校時與同目錄明文保存。** B1 的深藍介面、分組、搜尋及整理操作沿用。本輪實作範圍與逐項驗證見 [B2 使用與驗收](.Doc/B2-本地匯入產碼與保存.md)；B3 的備份還原、密碼保護、表格匯入及 WinAuth2 XML 匯出，以及 B4～B6 的帳號恢復／建立／綁定尚未提供。
+目前版本為 **0.2.0，仍在開發中**。
+
+## 功能
+
+- 手動匯入40位十六進位密鑰，或74位 WinAuth2 明文 `secretdata`。
+- 匯入前預覽驗證器資料與目前驗證碼，方便與其他驗證器比對。
+- 產生每30秒更新的八位驗證碼，支援複製與離線產碼。
+- 所有驗證器共用校時；新密鑰匯入成功後會嘗試校時，也可手動校時。
+- 分組、名稱搜尋、名稱與備註編輯、拖曳排序、批次移組及刪除。
+- 以可直接閱讀、編輯的 JSON 資料檔自動保存，執行期間鎖住資料檔。
+- 視窗置頂、拖動與調整大小；每次啟動使用固定尺寸及位置。
+
+全庫最多1000筆驗證器、20個分組（含未分組），每組最多100筆。目前尚未提供密碼加密、程式內備份還原、XML 匯入／匯出，以及驗證器的線上建立、恢復或綁定。
+
+## 下載
+
+下載頁：[GitHub Releases](https://github.com/EKE00372/BNAuth/releases)。
+
+目前尚未發佈 Release，也沒有可下載的 EXE；請依下方步驟自行編譯。
 
 ## 開始使用
 
-1. 直接開啟 [dist/BNAuth.exe](dist/BNAuth.exe)，或把 EXE 放到本機 NTFS 磁碟中、自己可寫入的資料夾再開啟。同目錄沒有資料檔時，按「建立資料」建立 `BNAuth.bnauth`；已有有效資料檔時直接載入。
-2. 按右下「新增」，輸入名稱、選擇分組，貼上 **40位密鑰或74位WinAuth2明文資料**。備註、序號、還原碼可選填；74位資料會解析並帶入實際序號。未取得的欄位留空。
-3. 按「預覽匯入」核對資料、目前八位驗證碼及重複提示；可用手上其他驗證器對照同一週期的碼，再按「確認匯入並保存」。保存成功才加入清單。相同密鑰不重複新增，只有缺少的資料可經確認補齊；已有值衝突會拒絕。
-4. 點複製圖示取得目前八位碼。離線也能產碼；未校時時使用本機 UTC，請保持 Windows 日期與時間正確。新密鑰保存後會自動嘗試一輪匿名校時，之後可按時鐘圖示手動校時。校時只更新本次執行使用的時間，不寫入資料檔；成功只顯示一次「校時成功」，失敗仍會提醒。重新啟動後先使用本機時間。
+1. 將 `BNAuth.exe` 放在本機 NTFS 磁碟中可寫入的資料夾，開啟程式。
+2. 首次使用時按「建立資料」，建立空的 `BNAuth.bnauth` 資料檔。
+3. 按「新增」，填寫名稱、選擇分組，貼上40位密鑰或74位明文資料。備註、序號與還原碼可選填；74位資料會自動帶入序號。
+4. 按「預覽匯入」，核對資料及八位驗證碼，再按「確認匯入並保存」。相同密鑰不會重複新增，只會經確認後補齊缺少的資料。
+5. 在清單中按複製圖示取得驗證碼，按時鐘圖示校時。離線時仍可產碼；尚未校時時使用本機時間，請保持電腦日期與時間正確。
 
-**B2 資料檔是明文，內含密鑰。** 請將 EXE 與 `BNAuth.bnauth` 一起妥善保管，勿公開上傳資料檔。正常關閉並確認沒有保存／清理警告後，可複製這兩個檔案保留副本；程式內的備份還原及密碼保護另於 B3 實作。工作主檔的位置固定，不另開任意工作檔。
+### 資料保存
 
-`BNAuth.bnauth` 以有縮排的 UTF-8 JSON 保存，可直接用文字編輯器閱讀。BNAuth 使用資料檔期間會持有讀取鎖，限制外部改寫、刪除或替換。若要手動修改，先關閉 BNAuth 並保留副本，再以 UTF-8 保存；欄位與關聯仍須符合[主檔格式](.Doc/native-format-v1.md)。專案尚未 release，開發階段不維護舊格式相容或自動遷移；遇到不相容的開發資料，先關閉程式，刪除 `BNAuth.bnauth`，再開啟程式重建空庫並重新匯入。
+資料自動保存於 EXE 同目錄的 `BNAuth.bnauth`，**以明文 JSON 儲存，內含密鑰與還原資訊**。請妥善保管，不要公開或上傳資料檔。
 
-主檔不再包含 `settings`。舊開發資料請先關閉程式並保留副本，再自行刪除整個頂層 `settings` 物件，包含其中的 `window_position` 和舊尺寸欄位，並調整相鄰逗號以維持 JSON 格式；其餘驗證器、備註與資料保持原文。程式不會自動轉換資料檔。
+需要備份時，先正常關閉程式並確認沒有保存或清理錯誤，再複製資料檔。若要用文字編輯器修改，也請先關閉程式並保留副本；修改後仍須符合資料格式與容量限制。
 
-保存、重複匯入、錯誤復原及本輪限制的完整步驟見 [B2 使用與驗收](.Doc/B2-本地匯入產碼與保存.md)。沒有主檔時才提供建立空庫；損壞、未知版本或無法讀取的主檔會停止載入，不用空庫覆蓋。
+校時結果只供本次執行使用，不寫入資料檔。重新開啟程式後先使用本機時間，可再按時鐘圖示校時。
 
-FAT32／exFAT 與網路路徑不在本版的可靠保存範圍。
+## 自行編譯
 
-## 清單操作
+### 準備環境
 
-- **主視窗：** 每次啟動固定為400×860內容區，含標題列為400×892，位於主螢幕可用工作區的右半部中央、垂直置中。允許拖動與手動調整至最大2160×3840（含標題列，按介面邏輯尺寸計算），不允許最大化；右上角保留置頂、最小化及關閉。移動、調整大小與介面縮放不寫入資料檔，下次啟動仍回到預設位置與尺寸。螢幕工作區較小時，啟動尺寸會縮小至可完整顯示。
-- **搜尋與選取：** 搜尋只比對名稱，固定涵蓋全部分組。右側「全選」選取目前結果，再按即全部取消；一般點擊單選／取消，Ctrl＋點擊加入或移出多選。
-- **分組與排序：** 分頁依名稱長度配置，長名省略，溢出時使用箭頭或停在分頁列上滾動。分組管理雙擊名稱原位改名，新增組名後按 Enter；↑／↓調整順序，右上×關閉。原位改名時按 Esc 只放棄改名草稿；點×會先校驗並保存有效名稱，無效名稱需修正或先放棄草稿。未分組固定第一個。
-- **編輯與整理：** 三點選單可編輯名稱／備註、移組、查看資料及刪除；支援組內拖曳排序、拖到其他分頁移組及批次整理。變更先保存，成功後更新清單。內容未修改就套用，或移到原本分組時，不顯示保存／移動提示，也不寫入資料檔。
-- **對話框：** 標題與右上×固定，只有內文捲動。關閉請點×，點外面或按 Esc 都不關閉；不另設取消／返回等關閉按鈕。匯入預覽保留「返回修改」，確認或套用操作完成後會收起對話框。
-- **容量：** 全庫最多1000筆、20組（含未分組），每組最多100筆。名稱必填、可同名；分組名稱不重複。已有密鑰不提供替換入口，新的驗證器資料重新匯入。
+- Windows x64。
+- [Rust](https://www.rust-lang.org/tools/install) 1.95 或更新版本，使用 `x86_64-pc-windows-msvc` 工具鏈。
+- [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)，安裝「使用 C++ 的桌面開發」（Desktop development with C++）工作負載及 Windows SDK。
+- Git；也可從 GitHub 的「Code → Download ZIP」取得原始碼。
 
-深藍介面使用一份 Nowar Sans TW Regular 400／1.0.1（有愛黑體），涵蓋 Latin、Cyrillic 與 CJK。B1 的字型、外觀修正及歷史驗收保留於 [B1 紀錄](.Doc/B1-介面預覽與驗收.md)，不代表新 B2 成品的所有實機條件均已重驗。
+### 編譯 EXE
 
-## 使用 CMD 檢查與建置
-
-直接使用 EXE 不需要 Rust 工具鏈。從原始碼建置須有 Rust 1.95 或相容工具鏈及 Visual Studio C++ Build Tools。`build.cmd` 固定2個建置工作，使用專案內 `.build` 快取；可用 `BNAUTH_TOOLCHAIN` 覆寫工具鏈位置。
-
-依賴已快取後，在 CMD 執行：
+安裝完成後，開啟 Visual Studio 的 **x64 Native Tools Command Prompt**，執行：
 
 ```bat
-cd /d D:\Github\BNAuth
-build.cmd check --workspace --offline
-build.cmd test --workspace --all-targets --offline
-build.cmd
+git clone https://github.com/EKE00372/BNAuth.git
+cd BNAuth
+cargo build --release --locked
 ```
 
-直接執行 `build.cmd` 會離線建置 Release，成功後自動將 `.build\target\release\BNAuth.exe` 複製到 `dist\BNAuth.exe`。傳入參數時則執行對應 Cargo 指令，例如上面的 check 與 test；只有不帶參數的交付建置會更新 `dist`。各批測試、成品 SHA-256 及實機結果記於對應驗收文件，建置成功不等於帳號、跨機或乾淨 Windows 已驗收。
+若使用 ZIP 取得原始碼，先切換到解壓縮後包含 `Cargo.toml` 的資料夾，再執行最後一行。
 
-在 Windows 桌面工作階段，用 PowerShell 檢查原生視窗首次顯示的位置與尺寸：
+首次編譯需要連線下載依賴。完成後，執行檔預設位於 `target\release\BNAuth.exe`；可將它複製到其他可寫入的本機 NTFS 資料夾使用。
 
-```powershell
-.\tests\windows-first-visible.ps1 -Executable .build/target/release/BNAuth.exe
+儲存庫中的 `build.cmd` 目前是維護者的本機建置腳本，包含固定工具鏈路徑。一般自行編譯請使用上述 Cargo 指令。
+
+### 執行測試
+
+在同一個開發命令提示字元、專案根目錄中執行：
+
+```bat
+cargo test --workspace --all-targets --locked
 ```
 
-測試會將指定 EXE 複製到新的隔離目錄，連續啟動3次，核對首次可見時即位於主螢幕工作區右半部中央、垂直置中，尺寸為400×892。工作區不足時按既有規則縮小；每次以正常關閉結束。測試不讀取現有資料檔，原生事件與結果保存在 `.build/windows-first-visible`。
+## 授權
 
-檢查 Windows 編譯組態確實包含 GitHub 連結的原生開網址支援：
+BNAuth 代碼採 [MIT License](LICENSE)。第三方函式庫授權見 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)。
 
-```powershell
-.\build.cmd metadata --format-version 1 --locked --offline --filter-platform x86_64-pc-windows-msvc > .build/native-metadata.json
-.\tests\native-links.ps1 -Metadata .build/native-metadata.json
-```
-
-這項檢查讀取 Cargo 已解析的功能與依賴鏈，不會開啟瀏覽器；說明內的 GitHub 點擊請求另由 Rust 介面回歸測試核對。
-
-## 本機開發文檔
-
-以下文檔保存在 `.Doc`，與 `.self` 工作封存、`.build` 建置資料、`dist` 成品一併由 `.gitignore` 排除，不隨 Git 提交。正式代碼、測試、字型與授權、Cargo 設定及本頁保留在專案中。
-
-- [B2 使用與驗收](.Doc/B2-本地匯入產碼與保存.md)
-- [原生 JSON 格式 v1](.Doc/native-format-v1.md)
-- [規劃總覽](.Doc/README.md)
-- [需求規格](.Doc/01-需求規格.md)
-- [架構設計](.Doc/02-架構設計.md)
-- [開發計畫與驗收](.Doc/03-開發計畫與驗收.md)
-- [B1 介面預覽與歷史驗收](.Doc/B1-介面預覽與驗收.md)
-- [早期 HTML 原型](.Doc/原型/README.md)
-- [RustAuth 來源索引](.Doc/參考/RustAuth-來源索引.md)
-- [B2 依賴與來源](.Doc/B2-依賴與來源.md)
-
-## 來源與授權
-
-BNAuth 維持 [MIT LICENSE](LICENSE)。RustAuth 只作功能與行為參考，產品及測試獨立撰寫，未納入 RustAuth 或研究副本的產品代碼。OTP 依 RFC 4226／6238 與公開向量實作；第三方函式庫、字型保留各自授權。
-
-直接依賴及 B2 HTTPS／密碼學依賴來源列於 [B2 依賴與來源](.Doc/B2-依賴與來源.md)，授權原文集中於 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)。Nowar 官方字型以原始 bytes 內嵌，來源見 [字型說明](assets/fonts/NOTICE.md)，授權見 [OFL-NowarSans.txt](assets/fonts/OFL-NowarSans.txt)。
+介面字型來源為有愛黑體（Nowar Sans），採 [SIL Open Font License 1.1](assets/fonts/OFL-NowarSans.txt)；來源與版本見[字型說明](assets/fonts/NOTICE.md)。
