@@ -49,27 +49,46 @@ BNAuth 是 Windows 戰網驗證器管理工具，以 Rust 與 egui／eframe 開�
 
 ### 編譯 EXE
 
-安裝完成後，開啟 Visual Studio 的 **x64 Native Tools Command Prompt**，執行：
+安裝完成後，開啟一般命令提示字元（CMD）。若要更新既有成品，請先關閉正在執行的 `dist\BNAuth.exe`，再執行：
 
 ```bat
 git clone https://github.com/EKE00372/BNAuth.git
 cd BNAuth
-cargo build --release --locked
+build.cmd
 ```
 
 若使用 ZIP 取得原始碼，先切換到解壓縮後包含 `Cargo.toml` 的資料夾，再執行最後一行。
 
-首次編譯需要連線下載依賴。完成後，執行檔預設位於 `target\release\BNAuth.exe`；可將它複製到其他可寫入的本機 NTFS 資料夾使用。
+首次編譯需要連線下載依賴。腳本會自動尋找 Rust 與 Visual Studio C++ 工具、設定 x64 編譯環境，再建立 Release 成品。完成後，執行檔位於 `dist\BNAuth.exe`；可將它複製到其他可寫入的本機 NTFS 資料夾使用。
 
-儲存庫中的 `build.cmd` 目前是維護者的本機建置腳本，包含固定工具鏈路徑。一般自行編譯請使用上述 Cargo 指令。
+若使用 PowerShell，請將指令寫成 `.\build.cmd`。
+
+Rust 會從 `PATH`、`CARGO_HOME\bin` 或使用者的 `.cargo\bin` 尋找；非標準安裝位置可透過 `BNAUTH_TOOLCHAIN` 指定包含 `cargo.exe`、`rustc.exe` 的目錄。Visual Studio 會使用目前的開發環境，或透過官方 `vswhere` 尋找已安裝的 C++ 工具，不綁定版本號與安裝位置。
+
+依賴快取與中間編譯檔預設放在 `.build`，也支援既有的 `CARGO_HOME`、`CARGO_TARGET_DIR` 設定。只有不帶參數執行 `build.cmd` 時，才會將成品複製到 `dist`；帶參數時會執行對應的 Cargo 指令。
+
+若依賴已快取，可離線編譯：
+
+```bat
+build.cmd build --release --locked --offline
+```
+
+這個指令只編譯，成品預設位於 `.build\target\release\BNAuth.exe`。也可在 Visual Studio 的 x64 開發命令提示字元直接執行 `cargo build --release --locked`，成品預設位於 `target\release\BNAuth.exe`。
 
 ### 執行測試
 
-在同一個開發命令提示字元、專案根目錄中執行：
+在專案根目錄中執行：
 
 ```bat
-cargo test --workspace --all-targets --locked
+build.cmd test --workspace --all-targets --locked
 ```
+
+`tests` 另附兩個需手動執行的 Windows 回歸驗證腳本，修改相關功能時可使用：
+
+- [native-links.ps1](tests/native-links.ps1)：確認原生開網址功能已包含在依賴中。
+- [windows-first-visible.ps1](tests/windows-first-visible.ps1)：檢查 EXE 第一次顯示時的視窗位置與尺寸。
+
+它們不會在一般編譯或 `cargo test` 時自動執行，驗證產物預設放在 `.build`。
 
 ## 授權
 
