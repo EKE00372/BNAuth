@@ -67,7 +67,6 @@ jobs:
       - name: Prepare Rust
         run: |
           rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Test the workspace
         shell: cmd
@@ -99,4 +98,3 @@ jobs:
           )
           if ($env:RELEASE_TAG.Contains('-')) { $arguments += '--prerelease' }
           gh @arguments
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
