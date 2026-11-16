@@ -1,0 +1,102 @@
+name: Build and Release
+run-name: Release ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本號，例如 0.2.0 或 v0.2.0，須與 Cargo.toml 相同'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bnauth-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0-x86_64-pc-windows-msvc
+
+    steps:
+      - name: Check out the selected commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $packageVersion = python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = $env:INPUT_VERSION.Trim() -creplace '^v', ''
+          if ($version -cne $packageVersion) {
+            throw "輸入版本與 Cargo.toml 不符；目前代碼版本為 $packageVersion。"
+          }
+          $tag = "v$packageVersion"
+          $existingTag = git tag --list $tag
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($existingTag) {
+            $tagCommit = git rev-parse "refs/tags/$tag^{commit}"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($tagCommit -ne $env:GITHUB_SHA) {
+              throw "標籤 $tag 已指向其他 commit；請選擇該版本的 commit，或更新代碼版本後發布。"
+            }
+          }
+          $response = Invoke-WebRequest -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" -Headers @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+          } -SkipHttpErrorCheck
+          if ($response.StatusCode -eq 200) { throw "Release $tag 已存在，不會覆蓋。" }
+          if ($response.StatusCode -ne 404) { throw "無法確認 Release 狀態：HTTP $($response.StatusCode)。" }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Prepare Rust
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test the workspace
+        shell: cmd
+        run: build.cmd test --workspace --all-targets --locked
+
+      - name: Check native browser support
+        run: |
+          New-Item -ItemType Directory -Force .build/release | Out-Null
+          .\build.cmd metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc > .build/release/metadata.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\tests\native-links.ps1 -Metadata .build/release/metadata.json
+
+      - name: Build the standalone executable
+        shell: cmd
+        run: build.cmd
+
+      - name: Publish the executable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $arguments = @(
+            'release', 'create', $env:RELEASE_TAG, 'dist/BNAuth.exe',
+            '--target', $env:GITHUB_SHA,
+            '--title', "BNAuth $env:RELEASE_TAG",
+            '--generate-notes',
+            '--notes', 'Windows x64 單一 EXE，下載 BNAuth.exe 後可直接執行。完整授權可在程式「說明」視窗的授權文字上按右鍵複製。'
+          )
+          if ($env:RELEASE_TAG.Contains('-')) { $arguments += '--prerelease' }
+          gh @arguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

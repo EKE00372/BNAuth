@@ -20,7 +20,9 @@ BNAuth 是 Windows 戰網驗證器管理工具，以 Rust 與 egui／eframe 開�
 
 下載頁：[GitHub Releases](https://github.com/EKE00372/BNAuth/releases)。
 
-目前尚未發佈 Release，也沒有可下載的 EXE；請依下方步驟自行編譯。
+選擇版本，在 **Assets** 下載 `BNAuth.exe`，即可直接執行，不需解壓縮或安裝。若尚無可下載的版本，請依下方步驟自行編譯。
+
+EXE 已包含字型與授權文字；完整授權可在程式「說明」視窗的授權文字上按右鍵複製。
 
 ## 開始使用
 
@@ -89,6 +91,19 @@ build.cmd test --workspace --all-targets --locked
 - [windows-first-visible.ps1](tests/windows-first-visible.ps1)：檢查 EXE 第一次顯示時的視窗位置與尺寸。
 
 它們不會在一般編譯或 `cargo test` 時自動執行，驗證產物預設放在 `.build`。
+
+## 發布 Release
+
+發布由 GitHub Actions 的 **Build and Release** 手動啟動，一般提交、推送代碼或標籤都不會觸發。
+
+1. 確認根目錄 `Cargo.toml` 的版本號正確，並將代碼與相應的 `Cargo.lock` 變更提交、推送。輸入的發布版本須與這份代碼的版本相同。
+2. 在 GitHub 開啟 **Actions → Build and Release → Run workflow**，選擇要發布的分支，通常為 `main`。
+3. 輸入版本號，例如 `0.2.0` 或 `v0.2.0`，再按 **Run workflow**。
+4. 流程會核對版本，執行全部 workspace 測試、原生開網址依賴檢查，再編譯 Windows x64 Release EXE。全部成功後建立 `v0.2.0` 這類版本標籤與 Release，上傳單一 `BNAuth.exe` 並生成更新說明。
+
+編譯與版本標籤固定使用本次執行選定的 commit。已存在的 Release 不會覆蓋；既有標籤若指向其他 commit，也會停止。版本含 `-beta.1`、`-rc.1` 等預發布後綴時，會標記為 Pre-release。
+
+發布附件只包含本次編譯的 EXE，資料檔與工作產物不會上傳。流程使用 GitHub 自動提供的 `GITHUB_TOKEN`，不需另設個人存取權杖。
 
 ## 授權
 
