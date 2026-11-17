@@ -19,6 +19,18 @@ mod input_limit_tests;
 #[path = "material_input_tests.rs"]
 mod material_input_tests;
 
+#[path = "xml_export_ui_tests.rs"]
+mod xml_export_ui_tests;
+
+#[path = "group_import_ui_tests.rs"]
+mod group_import_ui_tests;
+
+#[path = "full_restore_ui_tests.rs"]
+mod full_restore_ui_tests;
+
+#[path = "shared_clock_ui_tests.rs"]
+mod shared_clock_ui_tests;
+
 struct GroupUi {
     app: BnAuthApp,
     ctx: egui::Context,

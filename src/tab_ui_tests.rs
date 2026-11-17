@@ -163,6 +163,40 @@ impl TabUi {
 }
 
 #[test]
+fn right_click_exports_the_target_tab_without_switching_group_or_clearing_selection() {
+    let mut ui = TabUi::new(600.0, 5);
+    let selected = ui.app.model.entries[0].id;
+    ui.app.selected.insert(selected);
+    ui.app.query = "保留搜尋".into();
+    let before = ui.app.runtime.app.current.clone();
+    let point = ui.point("遊戲帳號").unwrap();
+    for pressed in [true, false] {
+        ui.frame(vec![
+            egui::Event::PointerMoved(point),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+    }
+    ui.settle(3);
+    ui.click(ui.point("匯出此分組…").unwrap());
+    let Some(Dialog::Export(form)) = &ui.app.dialog else {
+        panic!("Expected group export preview")
+    };
+    assert_eq!(form.format(), bnauth_adapters::export_file::Format::Group);
+    assert_eq!(form.name(), "遊戲帳號");
+    assert_eq!(ui.app.group, 0);
+    assert_eq!(ui.app.query, "保留搜尋");
+    assert_eq!(ui.app.selected, BTreeSet::from([selected]));
+    assert_eq!(ui.app.runtime.app.current, before);
+    assert!(ui.app.runtime.export_rx.is_none());
+    assert!(ui.app.runtime.sync_rx.is_none());
+}
+
+#[test]
 fn long_names_and_twenty_groups_keep_the_header_inside_narrow_windows() {
     for width in [320.0, 400.0] {
         let mut ui = TabUi::new(width, 20);

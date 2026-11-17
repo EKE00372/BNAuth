@@ -707,6 +707,7 @@ fn fresh_sync_sample() -> bnauth_core::clock::SyncSample {
 fn queue_sync_result(ui: &mut GroupUi, result: Result<bnauth_core::clock::SyncSample, String>) {
     let (sender, receiver) = std::sync::mpsc::channel();
     ui.app.runtime.sync_rx = Some(receiver);
+    ui.app.runtime.sync_manual = true;
     sender.send(result.map_err(Into::into)).unwrap();
 }
 
@@ -764,6 +765,7 @@ fn crossflow_import_saves_once_and_failed_candidate_owns_its_retry() {
         // Model a request already in flight so import never uses the network.
         let (_sender, receiver) = std::sync::mpsc::channel();
         ui.app.runtime.sync_rx = Some(receiver);
+        ui.app.runtime.sync_manual = true;
         ui.open(Dialog::Import(Box::new(import_draft())));
         ui.click(ui.point("預覽匯入"));
         let mut expected = ui.import().preview.as_ref().unwrap().candidate.clone();
@@ -948,6 +950,7 @@ fn time_sync_waits_for_a_result_and_reports_failures_after_the_sender_exits() {
             let last_success = ui.app.runtime.clock.last_success().cloned();
             let (sender, receiver) = std::sync::mpsc::channel();
             ui.app.runtime.sync_rx = Some(receiver);
+            ui.app.runtime.sync_manual = true;
 
             // An in-flight request has no result yet; keep waiting without
             // changing the current clock or reporting an error.
@@ -997,91 +1000,92 @@ fn time_sync_waits_for_a_result_and_reports_failures_after_the_sender_exits() {
 }
 
 #[test]
-fn time_sync_success_failure_and_retries_never_write_the_snapshot() {
-    for hidden in [None, Some(true), Some(false)] {
-        let mut ui = ready_ui_with_authenticator();
-        let mut original = ui.app.runtime.app.current.clone().unwrap();
-        // Existing diagnostic data must survive a new successful or failed sync.
-        original.service_time_sync.battlenet = Some(bnauth_core::TimeSyncRecord {
-            source: bnauth_core::TIME_SOURCE.into(),
-            server_time_ms: IMPORT_TEST_TIME,
-            local_wall_ms_at_sample: IMPORT_TEST_TIME,
-            offset_ms: 0,
-            rtt_ms: 10,
-        });
-        ui.use_memory_vault(original.clone());
-        for _ in 0..3 {
-            visible_frame(&mut ui, NORMAL_SIZE, false);
-        }
-        let gate = gated_repository_mode(&mut ui, true);
-        for (round, succeeds) in [true, false, true].into_iter().enumerate() {
-            queue_sync_result(
-                &mut ui,
-                if succeeds {
-                    Ok(fresh_sync_sample())
+fn time_sync_success_is_saved_and_failed_rounds_keep_the_last_saved_calibration() {
+    for manual in [false, true] {
+        for hidden in [None, Some(true), Some(false)] {
+            let mut ui = ready_ui_with_authenticator();
+            let original = ui.app.runtime.app.current.clone().unwrap();
+            let gate = gated_repository(&mut ui);
+            gate.release();
+            let mut expected_record = None;
+            let mut successful_rounds = 0;
+            for succeeds in [true, false, true] {
+                ui.app.notifications = Default::default();
+                let result = if succeeds {
+                    successful_rounds += 1;
+                    let at = Instant::now();
+                    let wall = bnauth_core::now_ms();
+                    let sample = bnauth_core::clock::validate_sample(
+                        wall + successful_rounds as i64 * 100,
+                        wall,
+                        wall,
+                        at,
+                        at,
+                    )
+                    .unwrap();
+                    expected_record = Some(sample.record.clone());
+                    Ok(sample)
                 } else {
                     Err("人工校時失敗".into())
-                },
-            );
-            match hidden {
-                Some(minimized) => {
-                    hidden_frame(&mut ui, minimized, false);
-                }
-                None => {
-                    visible_frame(&mut ui, NORMAL_SIZE, false);
-                }
-            }
-            let runtime = &ui.app.runtime;
-            assert!(runtime.sync_rx.is_none());
-            assert!(runtime.clock.is_synced());
-            assert!(!runtime.app.saving && !runtime.app.cleaning && !runtime.app.has_pending());
-            assert!(runtime.app.error.is_none());
-            assert_eq!(runtime.app.current.as_ref(), Some(&original));
-            assert_eq!(ui.app.model.snapshot(), original);
-            assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
-            if round == 0 {
-                let first_paint = Instant::now();
-                assert_eq!(ui.app.notifications.visible(first_paint), Some("校時成功"));
-                assert!(
-                    ui.app
-                        .notifications
-                        .visible(first_paint + Duration::from_secs(3))
-                        .is_none()
-                );
-                for _ in 0..3 {
-                    match hidden {
-                        Some(minimized) => {
-                            hidden_frame(&mut ui, minimized, false);
-                        }
-                        None => {
-                            visible_frame(&mut ui, NORMAL_SIZE, false);
-                        }
+                };
+                queue_sync_result(&mut ui, result);
+                ui.app.runtime.sync_manual = manual;
+                match hidden {
+                    Some(minimized) => {
+                        hidden_frame(&mut ui, minimized, false);
                     }
-                    assert!(ui.app.notifications.visible(Instant::now()).is_none());
+                    None => {
+                        visible_frame(&mut ui, NORMAL_SIZE, false);
+                    }
                 }
-            } else {
-                assert_eq!(ui.app.notifications.pending_warning_count(), 1);
+                if !manual {
+                    assert!(ui.app.notifications.visible(Instant::now()).is_none());
+                    assert_eq!(ui.app.notifications.pending_warning_count(), 0);
+                }
+                wait_hidden(&mut ui, true);
+                let runtime = &ui.app.runtime;
+                assert!(runtime.sync_rx.is_none() && runtime.clock.is_synced());
+                assert!(!runtime.app.saving && !runtime.app.has_pending());
+                let current = runtime.app.current.as_ref().unwrap();
+                assert_eq!(current.service_time_sync.battlenet, expected_record);
+                assert_eq!(current.authenticators, original.authenticators);
+                assert_eq!(current.groups, original.groups);
+                assert_eq!(current.revision, original.revision + successful_rounds);
                 assert_eq!(
-                    ui.app.notifications.visible(Instant::now()),
-                    Some("校時失敗：人工校時失敗")
+                    gate.commits.load(Ordering::Relaxed),
+                    successful_rounds as usize
                 );
+                if manual {
+                    assert_eq!(
+                        ui.app.notifications.visible(Instant::now()),
+                        Some(if succeeds {
+                            "校時成功並已保存"
+                        } else {
+                            "校時失敗：人工校時失敗"
+                        })
+                    );
+                } else {
+                    assert!(ui.app.notifications.visible(Instant::now()).is_none());
+                    assert_eq!(ui.app.notifications.pending_warning_count(), 0);
+                }
             }
         }
-        assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
     }
 }
 
 #[test]
-fn a_time_sync_result_arriving_during_close_never_saves_or_blocks_close() {
+fn a_successful_sync_received_during_close_is_saved_before_close_but_failure_does_not_write() {
     for hidden in [None, Some(true), Some(false)] {
         for succeeds in [true, false] {
             let mut ui = ready_ui_with_authenticator();
             let original = ui.app.runtime.app.current.clone().unwrap();
-            let gate = gated_repository_mode(&mut ui, true);
+            let gate = gated_repository(&mut ui);
+            let sample = fresh_sync_sample();
+            let expected = sample.record.clone();
             queue_sync_result(
                 &mut ui,
                 if succeeds {
-                    Ok(fresh_sync_sample())
+                    Ok(sample)
                 } else {
                     Err("人工關閉時校時失敗".into())
                 },
@@ -1090,63 +1094,82 @@ fn a_time_sync_result_arriving_during_close_never_saves_or_blocks_close() {
                 Some(minimized) => hidden_frame(&mut ui, minimized, true),
                 None => visible_frame(&mut ui, NORMAL_SIZE, true),
             };
-            assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
+            assert_eq!(
+                commands.contains(&egui::ViewportCommand::CancelClose),
+                succeeds
+            );
+            assert_eq!(ui.app.runtime.close_blocked(), succeeds);
+            gate.release();
+            wait_hidden(&mut ui, true);
             let runtime = &ui.app.runtime;
             assert!(runtime.close_requested && !runtime.close_blocked());
             assert_eq!(runtime.clock.is_synced(), succeeds);
-            assert!(runtime.sync_rx.is_none());
-            assert!(!runtime.app.saving && !runtime.app.has_pending());
-            assert_eq!(runtime.app.current.as_ref(), Some(&original));
-            assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
+            let current = runtime.app.current.as_ref().unwrap();
+            assert_eq!(current.revision, original.revision + u64::from(succeeds));
+            assert_eq!(
+                current.service_time_sync.battlenet.as_ref(),
+                succeeds.then_some(&expected)
+            );
+            assert_eq!(current.authenticators, original.authenticators);
+            assert_eq!(gate.commits.load(Ordering::Relaxed), usize::from(succeeds));
         }
     }
 }
 
 #[test]
-fn time_sync_during_a_data_save_neither_adds_a_write_nor_depends_on_save_success() {
+fn time_sync_during_a_data_save_waits_for_its_ack_and_preserves_both_changes() {
     for fail_commit in [false, true] {
         let mut ui = ready_ui_with_authenticator();
         let original = ui.app.runtime.app.current.clone().unwrap();
         let gate = gated_repository_mode(&mut ui, fail_commit);
-        // A request started before the edit may finish while its save is active.
         let (sender, receiver) = std::sync::mpsc::channel();
         ui.app.runtime.sync_rx = Some(receiver);
+        ui.app.runtime.sync_manual = true;
         let before = ui.app.model.change_token();
         ui.app.model.add_group("與校時同時保存的資料").unwrap();
         ui.app.persist_frame_changes(before, &ui.ctx);
         assert!(ui.app.runtime.app.saving);
-        sender.send(Ok(fresh_sync_sample())).unwrap();
+        let sample = fresh_sync_sample();
+        let expected = sample.record.clone();
+        sender.send(Ok(sample)).unwrap();
         drop(sender);
         visible_frame(&mut ui, NORMAL_SIZE, false);
         assert!(ui.app.runtime.clock.is_synced());
         assert_eq!(
-            ui.app.notifications.visible(Instant::now()),
-            Some("校時成功")
+            ui.app.runtime.pending_clock_record.as_ref(),
+            Some(&expected)
         );
+        assert!(ui.app.runtime.clock_save_inflight.is_none());
         gate.release();
         wait_hidden(&mut ui, true);
         let runtime = &ui.app.runtime;
-        assert!(runtime.clock.is_synced());
         assert_eq!(runtime.app.has_pending(), fail_commit);
         let current = runtime.app.current.as_ref().unwrap();
-        assert_eq!(current.service_time_sync, original.service_time_sync);
         if fail_commit {
             assert_eq!(current, &original);
+            assert_eq!(runtime.pending_clock_record.as_ref(), Some(&expected));
             assert_eq!(runtime.app.error.as_deref(), Some("人工延後保存失敗"));
         } else {
-            assert_eq!(current.revision, original.revision + 1);
+            assert_eq!(current.revision, original.revision + 2);
             assert_eq!(current.groups.len(), original.groups.len() + 1);
+            assert_eq!(
+                current.service_time_sync.battlenet.as_ref(),
+                Some(&expected)
+            );
+            assert_eq!(current.authenticators, original.authenticators);
+            assert!(
+                runtime.pending_clock_record.is_none() && runtime.clock_save_inflight.is_none()
+            );
         }
-        assert_eq!(ui.app.notifications.pending_warning_count(), 0);
-        for _ in 0..3 {
-            visible_frame(&mut ui, NORMAL_SIZE, false);
-        }
-        assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            gate.commits.load(Ordering::Relaxed),
+            if fail_commit { 1 } else { 2 }
+        );
     }
 }
 
 #[test]
-fn new_secret_import_reuses_an_active_sync_without_saving_its_result() {
+fn new_secret_import_reuses_an_active_sync_and_saves_its_result_after_the_import() {
     let mut ui = ready_ui_with_authenticator();
     let original = ui.app.runtime.app.current.clone().unwrap();
     let gate = gated_repository(&mut ui);
@@ -1165,11 +1188,9 @@ fn new_secret_import_reuses_an_active_sync_without_saving_its_result() {
         bnauth_core::now_ms(),
     )
     .unwrap();
-    assert!(preview.new_secret);
-    // The user starts a sync on the existing authenticator, then imports
-    // another key while that request is in flight. No real network is used.
     let (sender, receiver) = std::sync::mpsc::channel();
     ui.app.runtime.sync_rx = Some(receiver);
+    ui.app.runtime.sync_manual = true;
     ui.app.runtime.app.commit(preview.candidate, true).unwrap();
     gate.release();
     wait_hidden(&mut ui, true);
@@ -1180,32 +1201,32 @@ fn new_secret_import_reuses_an_active_sync_without_saving_its_result() {
     );
     assert_eq!(imported.revision, original.revision + 1);
     assert!(ui.app.runtime.sync_rx.is_some());
-    assert_eq!(
-        ui.app.notifications.visible(Instant::now()),
-        Some("正在校時…")
-    );
-    sender.send(Ok(fresh_sync_sample())).unwrap();
+    let sample = fresh_sync_sample();
+    let expected = sample.record.clone();
+    sender.send(Ok(sample)).unwrap();
     drop(sender);
-    for _ in 0..3 {
-        visible_frame(&mut ui, NORMAL_SIZE, false);
-    }
+    wait_hidden(&mut ui, true);
     let runtime = &ui.app.runtime;
     assert!(runtime.clock.is_synced() && runtime.sync_rx.is_none());
     assert!(!runtime.app.saving && !runtime.app.has_pending());
-    assert_eq!(runtime.app.current.as_ref(), Some(&imported));
-    assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+    let current = runtime.app.current.as_ref().unwrap();
+    assert_eq!(current.authenticators, imported.authenticators);
+    assert_eq!(current.groups, imported.groups);
     assert_eq!(
-        ui.app.notifications.visible(Instant::now()),
-        Some("校時成功")
+        current.service_time_sync.battlenet.as_ref(),
+        Some(&expected)
     );
+    assert_eq!(current.revision, imported.revision + 1);
+    assert_eq!(gate.commits.load(Ordering::Relaxed), 2);
 }
 
 #[test]
-fn hidden_save_completion_finishes_close_with_only_the_data_commit() {
+fn hidden_save_completion_finishes_close_after_data_and_calibration_are_saved() {
     let mut ui = ready_ui_with_authenticator();
     let gate = gated_repository(&mut ui);
     let (sender, receiver) = std::sync::mpsc::channel();
     ui.app.runtime.sync_rx = Some(receiver);
+    ui.app.runtime.sync_manual = true;
     let candidate = candidate_with_new_group(&ui);
     ui.app.runtime.app.commit(candidate, false).unwrap();
     visible_frame_at(
@@ -1230,12 +1251,12 @@ fn hidden_save_completion_finishes_close_with_only_the_data_commit() {
         let current = runtime.app.current.as_ref().unwrap();
         if commands.contains(&egui::ViewportCommand::Close) {
             assert_eq!(
-                current.revision, 1,
-                "only the data edit must be acknowledged"
+                current.revision, 2,
+                "both the data edit and successful calibration must be acknowledged"
             );
             assert!(!runtime.app.saving && !runtime.app.has_pending());
             assert_eq!(current.groups.len(), 2);
-            assert!(current.service_time_sync.battlenet.is_none());
+            assert_eq!(current.service_time_sync.battlenet.as_ref(), Some(&history));
             assert_eq!(runtime.clock.last_success(), Some(&history));
             assert!(runtime.clock.is_synced());
             break;
@@ -1243,7 +1264,7 @@ fn hidden_save_completion_finishes_close_with_only_the_data_commit() {
         assert!(Instant::now() < deadline, "hidden close did not complete");
         std::thread::yield_now();
     }
-    assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+    assert_eq!(gate.commits.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -1320,6 +1341,7 @@ fn explicit_residue_exit_from_warning_page_does_not_add_a_commit_for_a_late_sync
     // the save and the user's decision on the resulting cleanup-warning page.
     let (sender, receiver) = std::sync::mpsc::channel();
     ui.app.runtime.sync_rx = Some(receiver);
+    ui.app.runtime.sync_manual = true;
     let before = ui.app.model.change_token();
     ui.app.model.add_group("已保存但暫存未移除").unwrap();
     ui.app.persist_frame_changes(before, &ui.ctx);

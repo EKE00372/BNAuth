@@ -127,12 +127,22 @@ fn serial_cursor_after_formatting(
 
 impl BnAuthApp {
     pub(super) fn begin_time_sync(&mut self) {
+        self.begin_time_sync_for(true);
+    }
+
+    fn begin_time_sync_for(&mut self, manual: bool) {
         let runtime = &mut self.runtime;
         if runtime.close_requested {
             return;
         }
         if runtime.sync_rx.is_some() {
-            self.notify("正在校時…");
+            if manual && !runtime.sync_manual {
+                runtime.clock_notices.begin_sync();
+            }
+            runtime.sync_manual |= manual;
+            if manual {
+                self.notify("正在校時…");
+            }
             return;
         }
         runtime.clock_notices.begin_sync();
@@ -142,36 +152,109 @@ impl BnAuthApp {
             let _ = tx.send(bnauth_adapters::time_sync::synchronize(reference));
         });
         runtime.sync_rx = Some(rx);
-        self.notify("正在校時…");
+        runtime.sync_manual = manual;
+        if manual {
+            self.notify("正在校時…");
+        }
     }
     pub(super) fn poll_runtime(&mut self, ctx: &egui::Context) {
+        self.poll_runtime_with_clock(ctx, bnauth_core::clock::ClockObservation::now);
+    }
+
+    pub(super) fn poll_runtime_with_clock(
+        &mut self,
+        ctx: &egui::Context,
+        mut observation_source: impl FnMut() -> bnauth_core::clock::ClockObservation,
+    ) {
+        let observation = observation_source();
+        let mut clock_context = self.runtime.clock_storage_context();
+        // Observe continuity before ACKs can replace the old saved/in-flight
+        // values. Reuse this reading if an ACK then rebases the shared clock.
+        self.observe_shared_clock(observation, &clock_context);
         let (raw_close, hidden) = ctx.input(|i| {
             (
                 i.viewport().close_requested(),
                 i.viewport().visible() == Some(false),
             )
         });
+        self.runtime.close_requested |= raw_close;
+        self.poll_file_export(ctx);
+        self.poll_group_import(ctx);
+        self.poll_full_restore(ctx);
         let runtime = &mut self.runtime;
-        runtime.close_requested |= raw_close;
         let mut sync_after_commit = false;
         let mut storage_completed = false;
         let mut notice = None;
         let mut warnings = Vec::new();
+        let mut load_clock = false;
+        let mut cancel_clock = false;
         for event in runtime.app.poll() {
             storage_completed = true;
             match event {
                 Event::Loaded | Event::Committed { .. } => {
+                    load_clock |= matches!(event, Event::Loaded);
                     if let Some(snapshot) = &runtime.app.current {
                         self.model.apply_snapshot(snapshot);
                         self.otp_cache.clear();
                     }
                     if let Event::Committed { new_secret } = event {
-                        if let Some(warning) = &runtime.app.warning {
+                        let clock_commit = runtime.clock_save_inflight.is_some()
+                            || runtime.clock_invalidation_inflight;
+                        if std::mem::take(&mut runtime.pending_full_restore) {
+                            self.group = 0;
+                            self.tab_reveal = Some(0);
+                            self.query.clear();
+                            self.selected.clear();
+                            load_clock = true;
+                            notice = Some(if let Some(path) = &runtime.app.restore_backup {
+                                format!("已還原；還原前副本：{}", path.display())
+                            } else {
+                                "已還原完整資料庫".into()
+                            });
+                        }
+                        if let Some(group) = runtime.pending_import_group.take()
+                            && let Some(group) = self
+                                .model
+                                .groups
+                                .iter()
+                                .find(|entry| entry.persistent_id == group)
+                        {
+                            self.group = group.id;
+                            self.tab_reveal = Some(group.id);
+                            self.query.clear();
+                            self.selected.clear();
+                        }
+                        if let Some(warning) = &runtime.app.warning
+                            && (!clock_commit || runtime.clock_save_manual)
+                        {
                             warnings.push(warning.clone());
-                        } else {
+                        } else if notice.is_none() && !clock_commit {
                             notice = Some("已保存".to_owned());
                         }
                         sync_after_commit |= new_secret;
+                        if std::mem::take(&mut runtime.clock_invalidation_inflight)
+                            && runtime.app.current.as_ref().is_some_and(|snapshot| {
+                                snapshot.service_time_sync.battlenet.is_none()
+                            })
+                        {
+                            runtime.pending_clock_invalidation = false;
+                        }
+                        if let Some(saved) = runtime.clock_save_inflight.take()
+                            && runtime
+                                .app
+                                .current
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.service_time_sync.battlenet.as_ref())
+                                == Some(&saved)
+                        {
+                            if runtime.pending_clock_record.as_ref() == Some(&saved) {
+                                runtime.pending_clock_record = None;
+                                runtime.pending_clock_manual = false;
+                            }
+                            if std::mem::take(&mut runtime.clock_save_manual) {
+                                notice = Some("校時成功並已保存".into());
+                            }
+                        }
                     }
                 }
                 Event::Cleaned => {
@@ -184,24 +267,49 @@ impl BnAuthApp {
                         .into(),
                     );
                 }
-                Event::Failed => {}
+                Event::Failed => cancel_clock |= runtime.app.phase == Phase::Error,
             }
         }
 
+        if !runtime.app.has_pending() && !runtime.app.saving {
+            runtime.pending_import_group = None;
+            runtime.pending_full_restore = false;
+            // Also handle a caller explicitly discarding a failed clock write.
+            load_clock |= runtime.clock_save_inflight.is_some();
+        }
+        if load_clock {
+            self.load_shared_clock_observed(observation, &clock_context);
+            clock_context = self.runtime.clock_storage_context();
+        } else if cancel_clock {
+            self.cancel_clock_work();
+        }
+        let runtime = &mut self.runtime;
+        let sync_feedback = runtime.sync_manual;
         let mut specific_sync_rejection = None;
         let sync_result = runtime.sync_rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some(result) = sync_result {
             runtime.sync_rx = None;
+            runtime.sync_manual = false;
             match result {
-                Ok(sample) => match runtime.clock.apply(sample) {
-                    Ok(()) => {
-                        notice = Some("校時成功".into());
+                Ok(sample) => {
+                    let record = sample.record.clone();
+                    match runtime.clock.apply(sample) {
+                        Ok(()) => {
+                            let awaiting_manual_save = runtime.pending_clock_manual
+                                && runtime.pending_clock_record != runtime.clock_save_inflight;
+                            runtime.pending_clock_record = Some(record);
+                            runtime.pending_clock_invalidation = false;
+                            runtime.pending_clock_manual = sync_feedback || awaiting_manual_save;
+                            if sync_feedback {
+                                notice = Some("校時成功，正在保存…".into());
+                            }
+                        }
+                        Err(error) => {
+                            // apply already records the error and observes clock continuity.
+                            specific_sync_rejection = Some(error);
+                        }
                     }
-                    Err(error) => {
-                        // apply already records the error and observes clock continuity.
-                        specific_sync_rejection = Some(error);
-                    }
-                },
+                }
                 Err(failure) => {
                     let clock_discontinuity = failure.is_clock_discontinuity();
                     let error = failure.into_message();
@@ -209,16 +317,22 @@ impl BnAuthApp {
                     let message = format!("校時失敗：{error}");
                     if clock_discontinuity {
                         specific_sync_rejection = Some(message);
-                    } else {
+                    } else if sync_feedback {
                         warnings.push(message);
                     }
                 }
             }
         }
-        runtime.frame_time = runtime.clock.now_ms();
+        // A fresh result's apply() can observe a later Instant than poll start.
+        // Read again here; never move its last_tick backwards to the first read.
+        runtime.frame_time = runtime.clock.observe(observation_source());
+        if runtime.clock.take_invalidation() {
+            runtime.note_clock_invalidation_from(runtime.clock.is_synced(), &clock_context);
+        }
         if let Some(message) = runtime
             .clock_notices
             .observe(runtime.clock.status(), specific_sync_rejection)
+            && sync_feedback
         {
             warnings.push(message);
         }
@@ -230,8 +344,10 @@ impl BnAuthApp {
             self.notify(message);
         }
         if sync_after_commit && !closing {
-            self.begin_time_sync();
+            self.begin_time_sync_for(false);
         }
+
+        self.save_shared_clock_if_ready();
 
         let runtime = &self.runtime;
         if closing {
@@ -266,36 +382,65 @@ impl BnAuthApp {
             self.saving_ui(ui);
             return true;
         }
+        let mut restore = false;
+        let mut reload = false;
         let runtime = &mut self.runtime;
         if runtime.app.phase == Phase::Ready {
             return false;
         }
-        egui::Frame::NONE.fill(BG).inner_margin(18).show(ui,|ui| {
+        egui::Frame::NONE.fill(BG).inner_margin(18).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            ui.heading("BNAuth"); ui.add_space(12.0);
+            ui.heading("BNAuth");
+            ui.add_space(12.0);
             match runtime.app.phase {
-                Phase::Loading => { ui.spinner(); ui.label("正在讀取資料…"); }
+                Phase::Loading => {
+                    ui.spinner();
+                    ui.label("正在讀取資料…");
+                }
                 Phase::Missing => {
                     ui.label("建立驗證器資料");
                     ui.label("資料保存於程式同目錄的 BNAuth.bnauth。");
-                    ui.label("此批使用明文保存。請妥善保管 EXE 與資料檔；密碼保護及備份還原將於後續批次提供。");
+                    ui.label("資料及備份使用明文保存，內含密鑰與還原資訊。密碼保護尚未提供。");
                     ui.add_space(12.0);
                     if ui.button("建立資料").clicked()
-                        && let Err(error) = runtime.app.commit(VaultSnapshot::new_empty(bnauth_core::now_ms()),false) { runtime.app.error=Some(error); }
-                    ui.add_enabled(false,egui::Button::new("從備份還原（後續提供）"));
+                        && let Err(error) = runtime
+                            .app
+                            .commit(VaultSnapshot::new_empty(bnauth_core::now_ms()), false)
+                    {
+                        runtime.app.error = Some(error);
+                    }
+                    restore = ui.button("從備份還原…").clicked();
                 }
                 Phase::Error => {
-                    ui.colored_label(RED,"無法開啟資料檔");
-                    if let Some(error)=&runtime.app.error { ui.label(error); }
-                    if ui.button("重新讀取").clicked() { let _ = runtime.app.reload(); }
+                    ui.colored_label(RED, "無法開啟資料檔");
+                    if let Some(error) = &runtime.app.error {
+                        ui.label(error);
+                    }
+                    if ui.button("重新讀取").clicked() {
+                        reload = true;
+                    }
                 }
-                Phase::Ready=>{}
+                Phase::Ready => {}
             }
-            ui.add_space(12.0); ui.label(egui::RichText::new(runtime.path.display().to_string()).size(11.0).color(MUTED));
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new(runtime.path.display().to_string())
+                    .size(11.0)
+                    .color(MUTED),
+            );
         });
+        if restore {
+            self.open_full_restore(ui.ctx());
+        }
+        if reload && let Err(error) = self.reload_with_clock_cancel() {
+            self.runtime.app.error = Some(error);
+        }
         true
     }
     pub(super) fn saving_ui(&mut self, ui: &mut egui::Ui) {
+        let mut discard = false;
+        let mut reload_after_discard = false;
+        let mut reload = false;
         let runtime = &mut self.runtime;
         egui::Frame::NONE.fill(BG).inner_margin(18).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
@@ -348,12 +493,8 @@ impl BnAuthApp {
                 } else if !state.blocked && ui.button("繼續").clicked() {
                     runtime.app.warning = None;
                 }
-                if state.blocked
-                    && !state.cleanup_required
-                    && ui.button("重新讀取資料檔").clicked()
-                    && let Err(error) = runtime.app.reload()
-                {
-                    runtime.app.error = Some(error);
+                if state.blocked && !state.cleanup_required && ui.button("重新讀取資料檔").clicked() {
+                    reload = true;
                 }
                 if state.needs_attention() {
                     ui.label("若仍有暫存檔，關閉後會保留；下次開啟時會再次提醒處理。");
@@ -394,12 +535,7 @@ impl BnAuthApp {
                     runtime.app.error = Some(error);
                 }
                 if ui.button("放棄這次未保存變更").clicked() {
-                    runtime.app.discard();
-                    if !runtime.app.has_pending()
-                        && let Some(snapshot) = &runtime.app.current {
-                        self.model.apply_snapshot(snapshot);
-                        self.otp_cache.clear();
-                    }
+                    discard = true;
                 }
                 if ui
                     .add_enabled(
@@ -408,18 +544,18 @@ impl BnAuthApp {
                     )
                     .clicked()
                 {
-                    runtime.app.discard();
-                    if !runtime.app.has_pending()
-                        && let Some(snapshot) = &runtime.app.current {
-                        self.model.apply_snapshot(snapshot);
-                        self.otp_cache.clear();
-                    }
-                    if let Err(error) = runtime.app.reload() {
-                        runtime.app.error = Some(error);
-                    }
+                    discard = true;
+                    reload_after_discard = true;
                 }
             }
         });
+        if discard {
+            self.discard_unsaved_changes();
+            reload |= reload_after_discard;
+        }
+        if reload && let Err(error) = self.reload_with_clock_cancel() {
+            self.runtime.app.error = Some(error);
+        }
     }
     pub(super) fn persist_frame_changes(&mut self, before: u64, ctx: &egui::Context) {
         let runtime = &mut self.runtime;

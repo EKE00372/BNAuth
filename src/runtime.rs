@@ -33,6 +33,15 @@ impl Repository for DiskRepository {
     fn retry_cleanup(&mut self) -> Result<(), String> {
         self.0.retry_cleanup()
     }
+    fn restore(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
+        self.0.restore(candidate).map(|r| CommitOutcome {
+            snapshot: r.snapshot,
+            warning: r.warning,
+        })
+    }
+    fn last_restore_backup(&self) -> Option<PathBuf> {
+        self.0.restore_backup().map(|path| path.to_path_buf())
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WindowGeometry {
@@ -297,14 +306,97 @@ pub struct RuntimeState {
     pub clock: RuntimeClock,
     pub frame_time: i64,
     pub sync_rx: Option<Receiver<Result<SyncSample, bnauth_adapters::time_sync::SyncFailure>>>,
+    pub sync_manual: bool,
+    pub export_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+    pub group_import_rx: Option<Receiver<Result<Option<GroupImportFile>, String>>>,
+    pub pending_import_group: Option<uuid::Uuid>,
+    pub full_restore_rx:
+        Option<Receiver<Result<Option<crate::app::full_restore::RestoreFile>, String>>>,
+    pub pending_full_restore: bool,
+    pub pending_clock_record: Option<bnauth_core::TimeSyncRecord>,
+    pub clock_save_inflight: Option<bnauth_core::TimeSyncRecord>,
+    pub pending_clock_invalidation: bool,
+    pub clock_invalidation_inflight: bool,
+    pub invalidated_clock_records: Vec<bnauth_core::TimeSyncRecord>,
+    pub pending_clock_manual: bool,
+    pub clock_save_manual: bool,
     pub close_requested: bool,
     pub allow_close_with_residue: bool,
     pub clock_notices: ClockStatusNotices,
 }
+
+/// Storage values associated with the old clock before a load/restore ACK can
+/// replace Application.current or remove the in-flight calibration marker.
+pub(crate) struct ClockStorageContext {
+    saved: Option<bnauth_core::TimeSyncRecord>,
+    inflight: Option<bnauth_core::TimeSyncRecord>,
+}
+
 impl RuntimeState {
+    pub(crate) fn clock_storage_context(&self) -> ClockStorageContext {
+        ClockStorageContext {
+            saved: self
+                .app
+                .current
+                .as_ref()
+                .and_then(|snapshot| snapshot.service_time_sync.battlenet.clone()),
+            inflight: self.clock_save_inflight.clone(),
+        }
+    }
+
+    /// A wall-clock step invalidates every calibration still able to become the
+    /// saved value, not just the newest live sample. Keep these tombstones for
+    /// this process so restoring an old backup cannot make them valid again.
+    /// A fresh apply can first discover the old clock step while already leaving
+    /// a valid new live sample; that sample and its pending save must survive.
+    #[cfg(test)]
+    pub fn note_clock_invalidation(&mut self, preserve_fresh_sample: bool) {
+        let context = self.clock_storage_context();
+        self.note_clock_invalidation_from(preserve_fresh_sample, &context);
+    }
+
+    pub(crate) fn note_clock_invalidation_from(
+        &mut self,
+        preserve_fresh_sample: bool,
+        context: &ClockStorageContext,
+    ) {
+        let records = [
+            context.saved.clone(),
+            if preserve_fresh_sample {
+                None
+            } else {
+                self.clock.last_success().cloned()
+            },
+            context.inflight.clone(),
+            if preserve_fresh_sample {
+                None
+            } else {
+                self.pending_clock_record.clone()
+            },
+        ];
+        for record in records.into_iter().flatten() {
+            if !self.invalidated_clock_records.contains(&record) {
+                self.invalidated_clock_records.push(record);
+            }
+        }
+        if !preserve_fresh_sample {
+            self.pending_clock_record = None;
+            if self.app.phase == bnauth_app::Phase::Ready {
+                self.pending_clock_invalidation = true;
+            }
+            self.pending_clock_manual = false;
+            self.clock_save_manual = false;
+        }
+    }
+
     pub fn close_blocked(&self) -> bool {
         self.app.saving
             || self.app.cleaning
+            || self.export_rx.is_some()
+            || self.group_import_rx.is_some()
+            || self.full_restore_rx.is_some()
+            || ((self.pending_clock_record.is_some() || self.pending_clock_invalidation)
+                && !self.allow_close_with_residue)
             || self.app.has_pending()
             || ((self.app.warning.is_some() || self.app.repository_state.needs_attention())
                 && !self.allow_close_with_residue)
@@ -330,12 +422,38 @@ impl RuntimeState {
             clock: RuntimeClock::new(),
             frame_time: bnauth_core::now_ms(),
             sync_rx: None,
+            sync_manual: false,
+            export_rx: None,
+            group_import_rx: None,
+            pending_import_group: None,
+            full_restore_rx: None,
+            pending_full_restore: false,
+            pending_clock_record: None,
+            clock_save_inflight: None,
+            pending_clock_invalidation: false,
+            clock_invalidation_inflight: false,
+            invalidated_clock_records: Vec::new(),
+            pending_clock_manual: false,
+            clock_save_manual: false,
             close_requested: false,
             allow_close_with_residue: false,
             clock_notices: ClockStatusNotices::default(),
         }
     }
 }
+pub struct GroupImportFile {
+    pub path: PathBuf,
+    pub group_name: String,
+    pub source_count: usize,
+    pub preview: Result<bnauth_core::GroupImportPreview, String>,
+}
+
+#[derive(Default)]
+pub struct GroupImportForm {
+    pub loaded: Option<GroupImportFile>,
+    pub error: String,
+}
+
 pub struct ImportForm {
     pub name: String,
     pub description: String,

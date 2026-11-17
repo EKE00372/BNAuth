@@ -1,4 +1,4 @@
-//! A process-local Battle.net clock. Persisted measurement history is never an anchor.
+//! A shared Battle.net clock whose saved offset can be restored across launches.
 //!
 //! All OTPs and the progress bar should use one `now_ms` value per UI frame.
 
@@ -35,7 +35,8 @@ impl std::fmt::Display for SampleValidationError {
 
 impl std::error::Error for SampleValidationError {}
 
-/// Only fresh measurements have this process's `Instant`; this is not serializable.
+/// A current-process anchor for a fresh measurement or a reloaded saved offset.
+/// The `Instant` is reconstructed on reload and is not serializable.
 #[derive(Clone, Debug)]
 pub struct SyncSample {
     pub record: TimeSyncRecord,
@@ -70,19 +71,34 @@ impl ClockStatus {
     }
 }
 
-#[derive(Clone, Debug)]
-struct Observation {
+/// One wall-clock/monotonic reading shared by continuity checks and rebasing.
+/// Keeping this value avoids hiding a wall-clock step between those operations.
+#[derive(Clone, Copy, Debug)]
+pub struct ClockObservation {
     wall_ms: i64,
     instant: Instant,
+}
+
+impl ClockObservation {
+    pub fn now() -> Self {
+        Self::at(system_now_ms(), Instant::now())
+    }
+
+    /// Supply one reading from a caller-owned clock source, including simulations.
+    pub fn at(wall_ms: i64, instant: Instant) -> Self {
+        Self { wall_ms, instant }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct RuntimeClock {
     anchor: Option<SyncSample>,
-    last_tick: Observation,
+    last_tick: ClockObservation,
     last_success: Option<TimeSyncRecord>,
     last_error: Option<String>,
     discontinuous: bool,
+    from_saved: bool,
+    invalidation_pending: bool,
 }
 
 impl Default for RuntimeClock {
@@ -92,7 +108,7 @@ impl Default for RuntimeClock {
 }
 
 impl RuntimeClock {
-    /// A new process always starts on local UTC, irrespective of saved history.
+    /// Start on local UTC when no saved calibration has been loaded.
     pub fn new() -> Self {
         Self::at(system_now_ms(), Instant::now())
     }
@@ -100,15 +116,59 @@ impl RuntimeClock {
     fn at(wall_ms: i64, instant: Instant) -> Self {
         Self {
             anchor: None,
-            last_tick: Observation { wall_ms, instant },
+            last_tick: ClockObservation { wall_ms, instant },
             last_success: None,
             last_error: None,
             discontinuous: false,
+            from_saved: false,
+            invalidation_pending: false,
         }
     }
 
+    /// Apply the shared saved offset to today's local wall clock. The original
+    /// sample timestamp is historical metadata, never a frozen current time.
+    pub fn from_saved(record: Option<&TimeSyncRecord>) -> Result<Self, String> {
+        Self::from_saved_observation(record, ClockObservation::now())
+    }
+
+    /// Rebase at the same reading that was used to inspect the previous clock.
+    pub fn from_saved_observation(
+        record: Option<&TimeSyncRecord>,
+        observation: ClockObservation,
+    ) -> Result<Self, String> {
+        Self::from_saved_at(record, observation.wall_ms, observation.instant)
+    }
+
+    fn from_saved_at(
+        record: Option<&TimeSyncRecord>,
+        wall_ms: i64,
+        instant: Instant,
+    ) -> Result<Self, String> {
+        let mut clock = Self::at(wall_ms, instant);
+        if let Some(record) = record {
+            record.validate()?;
+            let corrected_ms = wall_ms
+                .checked_add(record.offset_ms)
+                .filter(|value| (MIN_SERVER_TIME_MS..MAX_SERVER_TIME_MS).contains(value))
+                .ok_or("保存的校時偏移套用後超出有效時間範圍，請手動校時。")?;
+            clock.anchor = Some(SyncSample {
+                record: record.clone(),
+                received_at: instant,
+                server_at_receive_ms: corrected_ms,
+                local_at_receive_ms: wall_ms,
+            });
+            clock.last_success = Some(record.clone());
+            clock.from_saved = true;
+        }
+        Ok(clock)
+    }
+
     pub fn now_ms(&mut self) -> i64 {
-        self.now_at(system_now_ms(), Instant::now())
+        self.observe(ClockObservation::now())
+    }
+
+    pub fn observe(&mut self, observation: ClockObservation) -> i64 {
+        self.now_at(observation.wall_ms, observation.instant)
     }
 
     fn now_at(&mut self, wall_ms: i64, instant: Instant) -> i64 {
@@ -129,21 +189,34 @@ impl RuntimeClock {
             )
         });
         if !tick_continuous || !anchor_continuous {
-            self.anchor = None;
-            self.discontinuous = true;
+            self.invalidate_anchor();
         }
-        self.last_tick = Observation { wall_ms, instant };
+        self.last_tick = ClockObservation { wall_ms, instant };
         if let Some(anchor) = &self.anchor {
             if let Some(value) = advance(anchor.server_at_receive_ms, anchor.received_at, instant) {
                 return value;
             }
-            self.anchor = None;
-            self.discontinuous = true;
+            self.invalidate_anchor();
         }
         wall_ms
     }
 
-    /// Only a validated fresh sample can establish an anchor. Disk history cannot.
+    fn invalidate_anchor(&mut self) {
+        if self.anchor.take().is_some() {
+            self.invalidation_pending = true;
+        }
+        self.discontinuous = true;
+    }
+
+    /// Consume the request to remove an invalid calibration from active storage.
+    /// Retaining `last_success` is only for history; it must not reactivate on
+    /// restart. A newer valid sample may already be active when this is consumed;
+    /// callers must invalidate old saved values without discarding that sample.
+    pub fn take_invalidation(&mut self) -> bool {
+        std::mem::take(&mut self.invalidation_pending)
+    }
+
+    /// Replace the current shared calibration with a validated fresh sample.
     pub fn apply(&mut self, sample: SyncSample) -> Result<(), String> {
         self.apply_at(sample, system_now_ms(), Instant::now())
     }
@@ -170,6 +243,7 @@ impl RuntimeClock {
         self.anchor = Some(sample);
         self.last_error = None;
         self.discontinuous = false;
+        self.from_saved = false;
         Ok(())
     }
 
@@ -189,6 +263,21 @@ impl RuntimeClock {
 
     pub fn is_synced(&self) -> bool {
         self.anchor.is_some()
+    }
+
+    /// Return the exact shared measured offset used for persistence and XML.
+    /// Observing the clocks first prevents exporting an invalidated calibration.
+    pub fn offset_ms(&mut self) -> Option<i64> {
+        self.offset_at(system_now_ms(), Instant::now())
+    }
+
+    fn offset_at(&mut self, wall_ms: i64, instant: Instant) -> Option<i64> {
+        self.now_at(wall_ms, instant);
+        self.anchor.as_ref().map(|anchor| anchor.record.offset_ms)
+    }
+
+    pub fn is_from_saved(&self) -> bool {
+        self.from_saved && self.anchor.is_some()
     }
 
     pub fn status(&self) -> ClockStatus {
@@ -212,7 +301,8 @@ impl RuntimeClock {
                 record.rtt_ms,
             ),
             (ClockStatus::SyncedAfterFailure, Some(record)) => format!(
-                "校時失敗；沿用 {} 的有效校時，請手動重試。",
+                "校時失敗；沿用{} {} 的有效校時，請手動重試。",
+                if self.from_saved { "已保存的" } else { "" },
                 format_utc(record.server_time_ms),
             ),
             (ClockStatus::Discontinuous, _) => "時間不連續，使用本機時間；請手動校時。".to_owned(),
@@ -400,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_clock_uses_local_time_not_stored_history() {
+    fn a_clock_without_saved_calibration_uses_local_time() {
         let base = Instant::now();
         let mut clock = RuntimeClock::at(BASE, base);
         assert_eq!(
@@ -414,6 +504,281 @@ mod tests {
         assert_eq!(clock.status(), ClockStatus::Local);
         assert!(!clock.is_synced());
         assert!(clock.last_success().is_none());
+    }
+
+    #[test]
+    fn saved_calibration_uses_current_wall_time_plus_offset_and_preserves_sample_metadata() {
+        let base = Instant::now();
+        let record = sample(base, 0, 120, 90_050).record;
+        let original = record.clone();
+        let today = BASE + 86_400_000 * 800;
+        let mut clock = RuntimeClock::from_saved_at(Some(&record), today, base).unwrap();
+        assert_eq!(clock.now_at(today, base), today + 90_050);
+        assert_eq!(
+            clock.now_at(today + 30_000, base + Duration::from_secs(30)),
+            today + 120_050
+        );
+        assert_eq!(
+            clock.offset_at(today + 30_000, base + Duration::from_secs(30)),
+            Some(90_050)
+        );
+        assert!(clock.is_synced() && clock.is_from_saved());
+        assert!(clock.status_text().starts_with("已校時 ·"));
+        assert_eq!(clock.last_success(), Some(&original));
+        assert_eq!(record, original);
+    }
+
+    #[test]
+    fn serialized_shared_offsets_survive_reopen_and_are_the_exact_xml_input_including_zero() {
+        let base = Instant::now();
+        for offset in [-90_050, -1, 0, 1, 90_050] {
+            let mut fresh = RuntimeClock::at(BASE, base);
+            fresh
+                .apply_at(sample(base, 0, 0, offset), BASE, base)
+                .unwrap();
+            let encoded = serde_json::to_vec(fresh.last_success().unwrap()).unwrap();
+            let saved: TimeSyncRecord = serde_json::from_slice(&encoded).unwrap();
+            let today = BASE + 86_400_000 * 300;
+            let mut reopened = RuntimeClock::from_saved_at(Some(&saved), today, base).unwrap();
+            // Every record's code and the export caller share this one clock;
+            // the XML writer alone maps a measured zero to its +1 ms sentinel.
+            for elapsed in [0_u64, 1, 29_999, 30_000, 60_000] {
+                let instant = base + Duration::from_millis(elapsed);
+                let wall = today + elapsed as i64;
+                assert_eq!(reopened.now_at(wall, instant), wall + offset);
+                assert_eq!(reopened.offset_at(wall, instant), Some(offset));
+            }
+            assert_eq!(reopened.last_success(), fresh.last_success());
+        }
+        let mut no_saved = RuntimeClock::from_saved_at(None, BASE, base).unwrap();
+        assert_eq!(no_saved.offset_at(BASE, base), None);
+        assert!(!no_saved.is_synced() && !no_saved.is_from_saved());
+        // Also cover the public wrappers with clocks from the current process.
+        let now = system_now_ms();
+        let record = TimeSyncRecord {
+            source: TIME_SOURCE.into(),
+            server_time_ms: now,
+            local_wall_ms_at_sample: now,
+            offset_ms: -1_234,
+            rtt_ms: 10,
+        };
+        assert_eq!(
+            RuntimeClock::from_saved(Some(&record)).unwrap().offset_ms(),
+            Some(-1_234)
+        );
+    }
+
+    #[test]
+    fn failed_refresh_keeps_reloaded_offset_but_a_new_sample_replaces_it() {
+        let base = Instant::now();
+        let saved = sample(base, 0, 0, 500).record;
+        let mut clock = RuntimeClock::from_saved_at(Some(&saved), BASE, base).unwrap();
+        clock.last_error = Some("離線".into());
+        assert_eq!(clock.offset_at(BASE, base), Some(500));
+        assert_eq!(clock.status(), ClockStatus::SyncedAfterFailure);
+        assert!(clock.status_text().contains("已保存的"));
+        assert_eq!(clock.last_success(), Some(&saved));
+        clock
+            .apply_at(
+                sample(base, 1_000, 0, -300),
+                BASE + 1_000,
+                base + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            clock.offset_at(BASE + 1_000, base + Duration::from_secs(1)),
+            Some(-300)
+        );
+        assert!(!clock.is_from_saved());
+        assert_eq!(clock.status(), ClockStatus::Synced);
+        assert!(clock.last_error().is_none());
+        assert_eq!(clock.last_success().unwrap().offset_ms, -300);
+    }
+
+    #[test]
+    fn reloaded_clock_jump_invalidates_export_offset_but_retains_saved_record() {
+        let base = Instant::now();
+        let record = sample(base, 0, 0, 300).record;
+        let mut clock = RuntimeClock::from_saved_at(Some(&record), BASE, base).unwrap();
+        assert_eq!(
+            clock.offset_at(BASE + 2_001, base + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(clock.status(), ClockStatus::Discontinuous);
+        assert!(!clock.is_from_saved());
+        assert_eq!(clock.last_success(), Some(&record));
+        assert_eq!(
+            clock.now_at(BASE + 3_001, base + Duration::from_secs(2)),
+            BASE + 3_001
+        );
+    }
+
+    #[test]
+    fn known_invalid_saved_offset_is_removed_once_and_cannot_reactivate_on_reopen() {
+        let base = Instant::now();
+        let fast_wall = BASE + 3_600_000;
+        let record = validate_sample(BASE, fast_wall, fast_wall, base, base)
+            .unwrap()
+            .record;
+        let mut persisted = Some(record.clone());
+        let mut clock = RuntimeClock::from_saved_at(persisted.as_ref(), fast_wall, base).unwrap();
+        assert_eq!(clock.now_at(fast_wall, base), BASE);
+        assert!(
+            !clock.take_invalidation(),
+            "loading a valid saved result is not an invalidation"
+        );
+
+        // Windows corrects the previously fast wall clock while BNAuth runs.
+        let corrected_wall = BASE + 1_000;
+        let later = base + Duration::from_secs(1);
+        assert_eq!(clock.now_at(corrected_wall, later), corrected_wall);
+        assert_eq!(clock.status(), ClockStatus::Discontinuous);
+        assert_eq!(
+            clock.last_success(),
+            Some(&record),
+            "history stays available"
+        );
+        if clock.take_invalidation() {
+            persisted = None;
+        } else {
+            panic!("a dropped valid anchor must request persisted invalidation");
+        }
+        assert!(
+            !clock.take_invalidation(),
+            "the persistence request is one-shot"
+        );
+        assert_eq!(
+            clock.offset_at(corrected_wall + 1_000, later + Duration::from_secs(1)),
+            None
+        );
+        assert!(
+            !clock.take_invalidation(),
+            "local fallback must not repeatedly request writes"
+        );
+
+        let encoded = serde_json::to_vec(&persisted).unwrap();
+        let reopened_record: Option<TimeSyncRecord> = serde_json::from_slice(&encoded).unwrap();
+        let mut reopened =
+            RuntimeClock::from_saved_at(reopened_record.as_ref(), corrected_wall, later).unwrap();
+        assert_eq!(reopened.now_at(corrected_wall, later), corrected_wall);
+        assert_eq!(reopened.offset_at(corrected_wall, later), None);
+        assert_eq!(reopened.status(), ClockStatus::Local);
+        assert!(!reopened.take_invalidation());
+    }
+
+    #[test]
+    fn observing_and_rebasing_at_one_reading_cannot_hide_an_unobserved_or_intermediate_step() {
+        let instant = Instant::now();
+        let fast_wall = BASE + 3_600_000;
+        let saved = validate_sample(BASE, fast_wall, fast_wall, instant, instant)
+            .unwrap()
+            .record;
+        let mut old = RuntimeClock::from_saved_observation(
+            Some(&saved),
+            ClockObservation::at(fast_wall, instant),
+        )
+        .unwrap();
+        let corrected = ClockObservation::at(BASE + 1_000, instant + Duration::from_secs(1));
+        assert!(
+            !old.take_invalidation(),
+            "a step is not signalled until observed"
+        );
+        assert_eq!(old.observe(corrected), BASE + 1_000);
+        assert!(old.take_invalidation());
+
+        // A genuinely distinct source remains usable at the same reading. A
+        // second step after that reading must still be visible after rebasing.
+        let source = validate_sample(
+            BASE + 1_250,
+            BASE + 1_000,
+            BASE + 1_000,
+            instant + Duration::from_secs(1),
+            instant + Duration::from_secs(1),
+        )
+        .unwrap()
+        .record;
+        let mut rebased = RuntimeClock::from_saved_observation(Some(&source), corrected).unwrap();
+        assert_eq!(rebased.observe(corrected), BASE + 1_250);
+        assert!(rebased.is_synced() && !rebased.take_invalidation());
+        let second_step = ClockObservation::at(BASE + 10_000, instant + Duration::from_secs(2));
+        assert_eq!(rebased.observe(second_step), BASE + 10_000);
+        assert!(rebased.take_invalidation());
+        assert!(!rebased.is_synced());
+    }
+
+    #[test]
+    fn stale_inflight_sample_cannot_restore_invalid_offset_but_a_new_sample_supersedes_it() {
+        let base = Instant::now();
+        let old_sample = sample(base, 0, 0, 300);
+        let old_record = old_sample.record.clone();
+        let mut clock = RuntimeClock::from_saved_at(Some(&old_record), BASE, base).unwrap();
+        let jumped_wall = BASE + 5_000;
+        let later = base + Duration::from_secs(1);
+        clock.now_at(jumped_wall, later);
+        assert!(clock.apply_at(old_sample, jumped_wall, later).is_err());
+        assert_eq!(clock.offset_at(jumped_wall, later), None);
+        assert_eq!(clock.last_success(), Some(&old_record));
+        assert!(
+            clock.clone().take_invalidation(),
+            "a rejected stale result cannot cancel the pending invalidation"
+        );
+
+        let current_sample =
+            validate_sample(BASE + 1_000, jumped_wall, jumped_wall, later, later).unwrap();
+        clock.apply_at(current_sample, jumped_wall, later).unwrap();
+        assert_eq!(clock.offset_at(jumped_wall, later), Some(-4_000));
+        assert_eq!(clock.status(), ClockStatus::Synced);
+        assert!(
+            clock.take_invalidation(),
+            "a newer valid sample must not hide old persisted invalidation"
+        );
+        assert_eq!(clock.offset_at(jumped_wall, later), Some(-4_000));
+        assert_eq!(clock.last_success().unwrap().offset_ms, -4_000);
+    }
+
+    #[test]
+    fn fresh_apply_reports_a_clock_jump_first_detected_inside_apply_without_losing_fresh_result() {
+        let base = Instant::now();
+        let saved = sample(base, 0, 0, 300).record;
+        let mut clock = RuntimeClock::from_saved_at(Some(&saved), BASE, base).unwrap();
+        let jumped_wall = BASE + 5_000;
+        let later = base + Duration::from_secs(1);
+        let fresh = validate_sample(BASE + 1_000, jumped_wall, jumped_wall, later, later).unwrap();
+        let fresh_record = fresh.record.clone();
+        // No previous UI frame has observed the changed wall clock yet.
+        clock.apply_at(fresh, jumped_wall, later).unwrap();
+        assert!(
+            clock.take_invalidation(),
+            "the old saved offset still needs invalidation"
+        );
+        assert!(!clock.take_invalidation());
+        assert_eq!(clock.status(), ClockStatus::Synced);
+        assert_eq!(clock.offset_at(jumped_wall, later), Some(-4_000));
+        assert_eq!(clock.last_success(), Some(&fresh_record));
+    }
+
+    #[test]
+    fn invalid_saved_calibration_and_unsafe_offset_arithmetic_are_rejected() {
+        let base = Instant::now();
+        let record = sample(base, 0, 0, 300).record;
+        let mut invalid = record.clone();
+        invalid.source = "https://unexpected.invalid/time".into();
+        assert!(RuntimeClock::from_saved_at(Some(&invalid), BASE, base).is_err());
+        invalid = record.clone();
+        invalid.server_time_ms = MIN_SERVER_TIME_MS - 1;
+        assert!(RuntimeClock::from_saved_at(Some(&invalid), BASE, base).is_err());
+        invalid = record.clone();
+        invalid.rtt_ms = 2_001;
+        assert!(RuntimeClock::from_saved_at(Some(&invalid), BASE, base).is_err());
+        for offset in [i64::MIN, i64::MAX] {
+            invalid = record.clone();
+            invalid.offset_ms = offset;
+            assert!(RuntimeClock::from_saved_at(Some(&invalid), BASE, base).is_err());
+        }
+        for wall in [i64::MIN, i64::MAX] {
+            assert!(RuntimeClock::from_saved_at(Some(&record), wall, base).is_err());
+        }
+        assert_eq!(record.offset_ms, 300);
     }
 
     #[test]

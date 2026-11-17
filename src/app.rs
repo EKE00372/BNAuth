@@ -4,6 +4,14 @@ mod app_runtime;
 #[path = "delete_confirmation.rs"]
 mod delete_confirmation;
 use delete_confirmation::DeleteConfirmation;
+#[path = "clock_persistence.rs"]
+mod clock_persistence;
+#[path = "file_export.rs"]
+mod file_export;
+#[path = "full_restore.rs"]
+pub(crate) mod full_restore;
+#[path = "group_import.rs"]
+mod group_import;
 #[path = "limited_edit.rs"]
 mod limited_edit;
 #[path = "text_preview.rs"]
@@ -110,6 +118,8 @@ fn reset_dialog_editors(ctx: &egui::Context) {
 
 enum Dialog {
     Import(Box<crate::runtime::ImportForm>),
+    GroupImport(Box<crate::runtime::GroupImportForm>),
+    FullRestore(Box<full_restore::RestoreForm>),
     Edit {
         id: u64,
         name: String,
@@ -117,6 +127,7 @@ enum Dialog {
         error: String,
     },
     Details(u64),
+    Export(Box<file_export::ExportForm>),
     Delete(DeleteConfirmation),
     Groups {
         name: String,
@@ -488,12 +499,27 @@ impl BnAuthApp {
                                                             );
                                                             ui.close();
                                                         }
-                                                        ui.add_enabled(
-                                                            false,
-                                                            egui::Button::new(
-                                                                "匯出此分組（後續接入）",
-                                                            ),
-                                                        );
+                                                        if ui.button("匯出此分組…").clicked()
+                                                        {
+                                                            self.open_group_export(ui.ctx(), g.id);
+                                                            ui.close();
+                                                        }
+                                                        if ui.button("匯入分組檔…").clicked()
+                                                        {
+                                                            self.open_group_import(ui.ctx());
+                                                            ui.close();
+                                                        }
+                                                        ui.separator();
+                                                        if ui.button("備份完整資料庫…").clicked()
+                                                        {
+                                                            self.open_full_backup(ui.ctx());
+                                                            ui.close();
+                                                        }
+                                                        if ui.button("還原完整資料庫…").clicked()
+                                                        {
+                                                            self.open_full_restore(ui.ctx());
+                                                            ui.close();
+                                                        }
                                                     });
                                                 });
                                             }
@@ -835,7 +861,10 @@ impl BnAuthApp {
                     self.open_dialog(ui.ctx(), Dialog::Details(e.id));
                     ui.close();
                 }
-                ui.add_enabled(false, egui::Button::new("匯出 WinAuth2 XML（後續接入）"));
+                if ui.button("匯出 WinAuth2 XML…").clicked() {
+                    self.open_xml_export(ui.ctx(), e.id);
+                    ui.close();
+                }
                 ui.separator();
                 if ui
                     .button(egui::RichText::new("刪除驗證器…").color(RED))
@@ -1052,8 +1081,11 @@ impl BnAuthApp {
         let (title, close_label) = match &dialog {
             Dialog::Import(form) if form.preview.is_some() => ("預覽匯入", "關閉匯入"),
             Dialog::Import(_) => ("匯入驗證器", "關閉匯入"),
+            Dialog::GroupImport(_) => ("匯入分組檔", "關閉分組匯入"),
+            Dialog::FullRestore(_) => ("還原完整資料庫", "關閉完整還原"),
             Dialog::Edit { .. } => ("編輯標題與說明", "關閉編輯"),
             Dialog::Details(_) => ("驗證器資料", "關閉驗證器資料"),
+            Dialog::Export(form) => (form.format().title(), "關閉匯出"),
             Dialog::Delete(_) => ("確定要刪除下列驗證器？", "關閉刪除確認"),
             Dialog::Groups { .. } => ("分組管理", "關閉分組管理"),
             Dialog::DeleteGroup(_) => ("刪除分組？", "關閉刪除分組確認"),
@@ -1080,7 +1112,15 @@ impl BnAuthApp {
                     },
                 );
                 if ui
-                    .add_sized([28.0, 28.0], egui::Button::new("×"))
+                    .add_enabled_ui(
+                        (!matches!(dialog, Dialog::Export(_)) || self.runtime.export_rx.is_none())
+                            && (!matches!(dialog, Dialog::GroupImport(_))
+                                || self.runtime.group_import_rx.is_none())
+                            && (!matches!(dialog, Dialog::FullRestore(_))
+                                || self.runtime.full_restore_rx.is_none()),
+                        |ui| ui.add_sized([28.0, 28.0], egui::Button::new("×")),
+                    )
+                    .inner
                     .on_hover_text(close_label)
                     .clicked()
                 {
@@ -1095,6 +1135,9 @@ impl BnAuthApp {
                     Dialog::Import(form) => {
                         keep = self.import_dialog(ui, form);
                     }
+                    Dialog::Export(form) => self.file_export_dialog(ui, form),
+                    Dialog::GroupImport(form) => keep = self.group_import_dialog(ui, form),
+                    Dialog::FullRestore(form) => keep = self.full_restore_dialog(ui, form),
                     Dialog::Edit {
                         id,
                         name,
@@ -1483,6 +1526,7 @@ impl BnAuthApp {
         }
         if self.startup_ui(root) {
             self.cancel_drag();
+            self.show_dialog(&ctx);
             return;
         }
         if self.runtime.app.saving
