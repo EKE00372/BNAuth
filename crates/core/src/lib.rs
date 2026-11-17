@@ -1,10 +1,12 @@
 //! Independent BNAuth domain contracts. No filesystem, network or GUI dependencies.
 
 pub mod clock;
+mod full_restore;
 mod group_import;
 mod manual;
 mod secret;
 
+pub use full_restore::{FullRestorePreview, prepare_full_restore};
 pub use group_import::{GroupImportPreview, GroupImportRow, prepare_group_import};
 pub use manual::{
     ImportPreview, ManualMaterial, display_serial, normalize_serial, parse_manual, prepare_import,

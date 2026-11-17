@@ -1,5 +1,6 @@
 //! Serialized background commits. The UI sees only acknowledged snapshots.
 use bnauth_core::VaultSnapshot;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -21,6 +22,14 @@ pub trait Repository {
     /// Validate the complete candidate before writing; failure must retain the
     /// last acknowledged snapshot and report any unresolved transaction state.
     fn commit(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String>;
+    /// Restore a complete candidate, preserving a verified pre-restore copy
+    /// before replacing an existing primary. Unsupported repositories refuse.
+    fn restore(&mut self, _candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
+        Err("目前保存介面不支援完整還原。".into())
+    }
+    fn last_restore_backup(&self) -> Option<PathBuf> {
+        None
+    }
     /// Retry residue removal only. This must never commit or advance a revision.
     fn retry_cleanup(&mut self) -> Result<(), String>;
     /// Report retained files or an uncertain transaction even when an operation fails.
@@ -33,14 +42,24 @@ pub type Factory = Box<dyn Fn() -> OpenResult + Send>;
 
 enum Command {
     Open,
-    Save(Box<VaultSnapshot>, bool),
+    Save(Box<VaultSnapshot>, bool, SaveMode),
     Cleanup,
     Stop,
 }
 enum Response {
     Opened(Result<(Option<VaultSnapshot>, RepositoryState), String>),
-    Saved(Result<CommitOutcome, String>, bool, RepositoryState),
+    Saved(
+        Result<CommitOutcome, String>,
+        bool,
+        RepositoryState,
+        Option<PathBuf>,
+    ),
     Cleaned(Result<(), String>, RepositoryState),
+}
+#[derive(Clone, Copy)]
+enum SaveMode {
+    Commit,
+    Restore,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -68,7 +87,8 @@ pub struct Application {
     pub error: Option<String>,
     pub warning: Option<String>,
     pub repository_state: RepositoryState,
-    pending: Option<(VaultSnapshot, bool)>,
+    pub restore_backup: Option<PathBuf>,
+    pending: Option<(VaultSnapshot, bool, SaveMode)>,
 }
 impl Application {
     pub fn start(factory: Factory) -> Self {
@@ -89,10 +109,18 @@ impl Application {
                             Err(error) => Err(error),
                         })
                     }
-                    Command::Save(candidate, new_secret) => {
+                    Command::Save(candidate, new_secret, mode) => {
                         let repo = repository.as_mut().expect("Save follows a successful Open");
-                        let result = repo.commit(&candidate);
-                        Response::Saved(result, new_secret, repo.state())
+                        let result = match mode {
+                            SaveMode::Commit => repo.commit(&candidate),
+                            SaveMode::Restore => repo.restore(&candidate),
+                        };
+                        let backup = if matches!(mode, SaveMode::Restore) && result.is_ok() {
+                            repo.last_restore_backup()
+                        } else {
+                            None
+                        };
+                        Response::Saved(result, new_secret, repo.state(), backup)
                     }
                     Command::Cleanup => {
                         let repo = repository
@@ -121,6 +149,7 @@ impl Application {
             error: None,
             warning: None,
             repository_state: RepositoryState::default(),
+            restore_backup: None,
             pending: None,
         };
         if let Err(error) = app.send(Command::Open) {
@@ -132,12 +161,24 @@ impl Application {
     /// Queue a candidate. Validation and storage run on the repository worker;
     /// their result is acknowledged by `poll`, with failures retained for retry.
     pub fn commit(&mut self, candidate: VaultSnapshot, new_secret: bool) -> Result<(), String> {
+        self.queue(candidate, new_secret, SaveMode::Commit)
+    }
+    pub fn restore(&mut self, candidate: VaultSnapshot, new_secret: bool) -> Result<(), String> {
+        self.queue(candidate, new_secret, SaveMode::Restore)
+    }
+    fn queue(
+        &mut self,
+        candidate: VaultSnapshot,
+        new_secret: bool,
+        mode: SaveMode,
+    ) -> Result<(), String> {
         if self.saving || self.cleaning || self.phase == Phase::Loading || self.pending.is_some() {
             return Err("前一次保存或暫存檔移除尚未完成。".into());
         }
         self.require_repository()?;
         self.require_writable()?;
-        self.pending = Some((candidate, new_secret));
+        self.restore_backup = None;
+        self.pending = Some((candidate, new_secret, mode));
         self.retry()
     }
     pub fn retry(&mut self) -> Result<(), String> {
@@ -146,8 +187,12 @@ impl Application {
         }
         self.require_repository()?;
         self.require_writable()?;
-        let (snapshot, new_secret) = self.pending.as_ref().ok_or("沒有需要保存的變更。")?;
-        self.send(Command::Save(Box::new(snapshot.clone()), *new_secret))?;
+        let (snapshot, new_secret, mode) = self.pending.as_ref().ok_or("沒有需要保存的變更。")?;
+        self.send(Command::Save(
+            Box::new(snapshot.clone()),
+            *new_secret,
+            *mode,
+        ))?;
         self.error = None;
         self.saving = true;
         Ok(())
@@ -230,6 +275,7 @@ impl Application {
                     self.error = None;
                     self.warning = None;
                     self.repository_state = state;
+                    self.restore_backup = None;
                     events.push(Event::Loaded);
                 }
                 Response::Opened(Err(error)) => {
@@ -239,7 +285,7 @@ impl Application {
                     // Only a successful open replaces that state with a fresh repository.
                     events.push(Event::Failed);
                 }
-                Response::Saved(Ok(result), new_secret, state) => {
+                Response::Saved(Ok(result), new_secret, state, backup) => {
                     self.current = Some(result.snapshot);
                     self.warning = result.warning;
                     self.pending = None;
@@ -247,9 +293,10 @@ impl Application {
                     self.error = None;
                     self.phase = Phase::Ready;
                     self.repository_state = state;
+                    self.restore_backup = backup;
                     events.push(Event::Committed { new_secret });
                 }
-                Response::Saved(Err(error), _, state) => {
+                Response::Saved(Err(error), _, state, _) => {
                     self.saving = false;
                     self.error = Some(error);
                     self.repository_state = state;
@@ -563,3 +610,6 @@ mod tests {
 
 #[cfg(test)]
 mod application_commit_tests;
+
+#[cfg(test)]
+mod application_restore_tests;

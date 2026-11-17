@@ -127,6 +127,8 @@ pub struct Repository {
     fingerprint: Option<FileStamp>,
     blocked: bool,
     cleanup_pending: Vec<OwnedFile>,
+    restore_copy: Option<(FileStamp, OwnedFile)>,
+    last_restore_backup: Option<PathBuf>,
     // Release the deny-write/delete handle before the named mutex on Drop.
     primary_guard: Option<File>,
     _lock: platform::Lock,
@@ -178,6 +180,8 @@ impl Repository {
                 fingerprint,
                 blocked: false,
                 cleanup_pending: vec![],
+                restore_copy: None,
+                last_restore_backup: None,
                 primary_guard,
                 _lock: lock,
                 _thread_bound: PhantomData,
@@ -194,8 +198,108 @@ impl Repository {
         self.blocked
     }
 
+    pub fn restore_backup(&self) -> Option<&Path> {
+        self.last_restore_backup.as_deref()
+    }
+
+    /// A replacement restore must first preserve a verified, independent copy
+    /// of the last acknowledged primary. This copy is never transaction residue.
+    pub fn restore(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
+        self.validate_candidate(candidate)?;
+        self.check_current()?;
+        let backup = self.prepare_restore_copy()?;
+        // Keep the verified copy protected from outside writes/deletion until
+        // the ordinary commit has either succeeded or retained its candidate.
+        let result = self.commit_validated(candidate);
+        if result.is_ok() {
+            // IO remains bound to the verified volume path. Report the same
+            // filename through the original, user-readable directory spelling.
+            self.last_restore_backup = backup.as_ref().map(|(_, path)| {
+                self.original_parent.join(
+                    path.file_name()
+                        .expect("generated safety copy has a filename"),
+                )
+            });
+        }
+        drop(backup);
+        result
+    }
+
+    fn prepare_restore_copy(&mut self) -> Result<Option<(File, PathBuf)>, String> {
+        let Some(expected) = self.fingerprint else {
+            return Ok(None);
+        };
+        if let Some((source, owned)) = &self.restore_copy
+            && *source == expected
+        {
+            let mut file = platform::open_guarded(&owned.path, false)?
+                .ok_or("還原前副本已不存在，未取代目前資料；請保留檔案並重新開啟程式。")?;
+            // This stamp identifies the same bytes already decoded and validated
+            // as the acknowledged primary; the held handle protects the copy.
+            let (_, stamp) = inspect_open(&mut file)?;
+            if stamp != owned.stamp {
+                return Err(
+                    "還原前副本已被外部修改，未取代目前資料；請保留檔案並重新開啟程式。".into(),
+                );
+            }
+            return Ok(Some((file, owned.path.clone())));
+        }
+        let mut original =
+            platform::open_guarded(&self.path, false)?.ok_or("目前資料檔已不存在，未開始還原。")?;
+        let (bytes, stamp) = inspect_open(&mut original)?;
+        if stamp != expected {
+            return Err("目前資料檔與已載入資料不同，未開始還原。".into());
+        }
+        self.inject(FaultPoint::BeforeRestoreCopy)?;
+        let path = self.canonical_parent.join(format!(
+            "BNAuth-before-restore-{}-{}.bnauth",
+            now_ms(),
+            Uuid::new_v4()
+        ));
+        let mut copy = platform::create_temp(&path)
+            .map_err(|error| format!("無法建立還原前副本，未取代目前資料（{error}）。"))?;
+        let verified: Result<FileStamp, String> = (|| {
+            copy.write_all(&bytes).map_err(io_error)?;
+            self.inject(FaultPoint::RestoreCopyFlush)?;
+            copy.sync_all().map_err(io_error)?;
+            let (actual, stamp) = inspect_open(&mut copy)?;
+            // Exact readback equality preserves the validated source without
+            // allocating and validating another full snapshot.
+            if actual.as_slice() != bytes.as_slice() {
+                return Err("還原前副本讀回核對失敗。".into());
+            }
+            Ok(stamp)
+        })();
+        let stamp = match verified {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                let cleanup = platform::delete_open(&copy);
+                return Err(format!(
+                    "無法完成還原前副本，未取代目前資料：{error}{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("\n副本尚未移除：{}（{error}）", path.display()))
+                        .unwrap_or_default()
+                ));
+            }
+        };
+        self.restore_copy = Some((
+            expected,
+            OwnedFile {
+                path: path.clone(),
+                stamp,
+            },
+        ));
+        Ok(Some((copy, path)))
+    }
+
     /// Candidate uses the last committed revision. This method owns revision advancement.
     pub fn commit(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
+        self.validate_candidate(candidate)?;
+        self.commit_validated(candidate)
+    }
+
+    fn validate_candidate(&self, candidate: &VaultSnapshot) -> Result<(), String> {
         if self.blocked {
             return Err("資料檔狀態需要檢查，已停止保存。請保留檔案並重新開啟 BNAuth。".into());
         }
@@ -220,6 +324,14 @@ impl Repository {
             }
             None => (),
         }
+        candidate
+            .revision
+            .checked_add(1)
+            .ok_or("資料檔的保存次數已達上限，無法繼續保存。")?;
+        Ok(())
+    }
+
+    fn commit_validated(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
         self.check_current()?;
         let mut next = candidate.clone();
         next.revision = candidate
@@ -650,6 +762,8 @@ fn find_remnants(parent: &Path) -> Result<Vec<PathBuf>, String> {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaultPoint {
+    BeforeRestoreCopy,
+    RestoreCopyFlush,
     BeforeWrite,
     BeforeFlush,
     AfterStage,
@@ -966,3 +1080,7 @@ mod platform {
 #[cfg(all(test, windows))]
 #[path = "storage_tests.rs"]
 mod tests;
+
+#[cfg(all(test, windows))]
+#[path = "storage_restore_tests.rs"]
+mod restore_tests;
