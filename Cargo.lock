@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "bnauth-adapters"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bnauth-core",
  "serde",
@@ -440,14 +440,14 @@ dependencies = [
 
 [[package]]
 name = "bnauth-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bnauth-core",
 ]
 
 [[package]]
 name = "bnauth-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hmac",
  "serde",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "bnauth-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bnauth-adapters",
  "bnauth-app",

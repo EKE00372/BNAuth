@@ -1,10 +1,10 @@
 [package]
 name = "bnauth-desktop"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "BNAuth Windows authenticator manager — B2 local import, OTP and durable storage"
+description = "BNAuth Windows authenticator manager — local import, OTP, WinAuth2 export and durable storage"
 
 [workspace]
 members = [".", "crates/core", "crates/application", "crates/adapters"]
