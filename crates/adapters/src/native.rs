@@ -8,7 +8,6 @@ use std::{
     fmt,
     io::{self, Write},
 };
-#[cfg(test)]
 use std::{fs::File, io::Read, path::Path};
 use zeroize::Zeroizing;
 
@@ -43,6 +42,11 @@ pub fn encode(snapshot: &VaultSnapshot) -> Result<Zeroizing<Vec<u8>>, String> {
     encode_validated(snapshot)
 }
 
+pub fn encode_group(snapshot: &VaultSnapshot) -> Result<Zeroizing<Vec<u8>>, String> {
+    snapshot.validate_group_export()?;
+    encode_validated(snapshot)
+}
+
 /// Internal serialization after the repository has validated the full candidate.
 /// Advancing its revision and timestamp preserves that validation; file-size
 /// limits still apply here, and installed bytes are independently read back.
@@ -56,15 +60,43 @@ pub(crate) fn encode_validated(snapshot: &VaultSnapshot) -> Result<Zeroizing<Vec
 }
 
 pub fn decode(bytes: &[u8]) -> Result<VaultSnapshot, String> {
+    decode_scoped(bytes, false)
+}
+
+/// Inspect a group export without allowing it to be loaded as a working vault.
+pub fn decode_group(bytes: &[u8]) -> Result<VaultSnapshot, String> {
+    decode_scoped(bytes, true)
+}
+
+pub fn read_group(path: &Path) -> Result<VaultSnapshot, String> {
+    read_scoped(path, true)
+}
+
+/// Read a full backup without accepting a partial group export as a database.
+pub fn read_full(path: &Path) -> Result<VaultSnapshot, String> {
+    read_scoped(path, false)
+}
+
+fn read_scoped(path: &Path, group: bool) -> Result<VaultSnapshot, String> {
+    let label = if group { "分組檔" } else { "完整備份" };
+    let file = File::open(path).map_err(|error| format!("無法開啟{label}（{error}）。"))?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_FILE as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("無法讀取{label}（{error}）。"))?;
+    decode_scoped(&bytes, group)
+}
+
+fn decode_scoped(bytes: &[u8], group: bool) -> Result<VaultSnapshot, String> {
     if bytes.len() > MAX_FILE {
         return Err("資料檔超過 32 MiB 上限。".into());
     }
     // Editors may add a UTF-8 BOM or change line endings. Neither changes the DTO.
     let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    decode_json(body)
+    decode_json(body, group)
 }
 
-fn decode_json(body: &[u8]) -> Result<VaultSnapshot, String> {
+fn decode_json(body: &[u8], group: bool) -> Result<VaultSnapshot, String> {
     #[cfg(all(test, windows))]
     JSON_DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut parser = serde_json::Deserializer::from_slice(body);
@@ -74,7 +106,11 @@ fn decode_json(body: &[u8]) -> Result<VaultSnapshot, String> {
         .map_err(|_| "資料檔內容有重複欄位、層次或項目過多，或格式錯誤。".to_owned())?;
     let snapshot: VaultSnapshot = serde_json::from_slice(body)
         .map_err(|_| "資料檔的格式或部分內容不受支援，無法讀取；原檔不會被覆寫。".to_owned())?;
-    snapshot.validate()?;
+    if group {
+        snapshot.validate_group_export()?;
+    } else {
+        snapshot.validate()?;
+    }
     Ok(snapshot)
 }
 

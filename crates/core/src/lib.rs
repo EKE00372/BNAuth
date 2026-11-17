@@ -1,9 +1,11 @@
 //! Independent BNAuth domain contracts. No filesystem, network or GUI dependencies.
 
 pub mod clock;
+mod group_import;
 mod manual;
 mod secret;
 
+pub use group_import::{GroupImportPreview, GroupImportRow, prepare_group_import};
 pub use manual::{
     ImportPreview, ManualMaterial, display_serial, normalize_serial, parse_manual, prepare_import,
 };
@@ -157,6 +159,57 @@ impl VaultSnapshot {
         if self.schema_version != 1 || self.scope != "full" {
             return Err("資料格式版本不受支援，或檔案未包含完整資料。".into());
         }
+        self.validate_contents(true)
+    }
+
+    /// A group export is deliberately separate from a complete working file.
+    /// It may contain a custom group without the system ungrouped group.
+    pub fn validate_group_export(&self) -> Result<(), String> {
+        if self.schema_version != 1 || self.scope != "group" || self.groups.len() != 1 {
+            return Err("分組匯出檔必須使用格式版本1，且只包含一個分組。".into());
+        }
+        if !self.groups[0].is_ungrouped && self.groups[0].name.trim().to_lowercase() == "未分組"
+        {
+            return Err("分組檔中的「未分組」必須使用系統分組標記。".into());
+        }
+        self.validate_contents(false)
+    }
+
+    /// Extract every record in the selected group from a committed full vault.
+    /// Source identity, metadata and per-record fields are retained unchanged.
+    pub fn export_group(&self, group_id: Uuid) -> Result<Self, String> {
+        self.validate()?;
+        let mut group = self
+            .groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .ok_or("找不到要匯出的分組。")?
+            .clone();
+        group.sort_order = 0;
+        let mut authenticators: Vec<_> = self
+            .authenticators
+            .iter()
+            .filter(|record| record.group_id == group_id)
+            .cloned()
+            .collect();
+        authenticators.sort_by_key(|record| record.sort_order);
+        let exported = Self {
+            schema_version: self.schema_version,
+            scope: "group".into(),
+            vault_id: self.vault_id,
+            revision: self.revision,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            groups: vec![group],
+            authenticators,
+            service_time_sync: self.service_time_sync.clone(),
+            provenance: self.provenance.clone(),
+        };
+        exported.validate_group_export()?;
+        Ok(exported)
+    }
+
+    fn validate_contents(&self, require_ungrouped: bool) -> Result<(), String> {
         if self.vault_id.is_nil() {
             return Err("資料檔缺少有效識別碼。".into());
         }
@@ -191,7 +244,7 @@ impl VaultSnapshot {
                 }
             }
         }
-        if system_count != 1 {
+        if require_ungrouped && system_count != 1 {
             return Err("資料檔必須包含一個「未分組」，不能缺少或重複。".into());
         }
         let mut orders: HashMap<Uuid, Vec<u32>> = HashMap::new();
