@@ -19,6 +19,9 @@ mod input_limit_tests;
 #[path = "material_input_tests.rs"]
 mod material_input_tests;
 
+#[path = "email_recovery_tests.rs"]
+mod email_recovery_tests;
+
 #[path = "xml_export_ui_tests.rs"]
 mod xml_export_ui_tests;
 
@@ -61,7 +64,7 @@ fn import_draft() -> crate::runtime::ImportForm {
 }
 
 fn large_list_vault() -> bnauth_core::VaultSnapshot {
-    let mut vault = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+    let mut vault = bnauth_core::VaultSnapshot::new_empty();
     for group in 1..10 {
         vault.groups.push(bnauth_core::Group {
             id: uuid::Uuid::new_v4(),
@@ -72,18 +75,9 @@ fn large_list_vault() -> bnauth_core::VaultSnapshot {
     }
     let material =
         bnauth_core::parse_manual("3132333435363738393031323334353637383930", "", "").unwrap();
-    let mut record = bnauth_core::prepare_import(
-        &vault,
-        "Row",
-        "",
-        vault.groups[0].id,
-        material,
-        IMPORT_TEST_TIME,
-    )
-    .unwrap()
-    .candidate
-    .authenticators
-    .remove(0);
+    let mut record = bnauth_core::prepare_import(&vault, "Row", "", vault.groups[0].id, material)
+        .unwrap()
+        .record();
     for index in 0..1000usize {
         let mut secret = [0; 20];
         secret[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
@@ -91,7 +85,7 @@ fn large_list_vault() -> bnauth_core::VaultSnapshot {
         record.group_id = vault.groups[index / 100].id;
         record.sort_order = (index % 100) as u32;
         record.name = format!("Row {index:04}");
-        record.secret = Some(bnauth_core::Secret::from_bytes(secret));
+        record.secret = bnauth_core::Secret::from_bytes(secret);
         vault.authenticators.push(record.clone());
     }
     vault.validate().unwrap();
@@ -196,7 +190,7 @@ fn delete_confirmation_only_renders_visible_rows_and_reflows_wrapped_names() {
         }
         _ => unreachable!(),
     };
-    assert!(!ui.points("Row 0000 · 未分組").is_empty());
+    assert!(!ui.points("Row 0000 · 預設").is_empty());
     assert!(ui.points("Row 0998 · Group 9").is_empty());
     for _ in 0..10 {
         ui.frame(Vec::new());
@@ -267,7 +261,7 @@ fn delete_confirmation_tail_is_correct_on_the_first_scaled_frame() {
                 let last = ui.app.model.entries.last().unwrap();
                 let label = format!(
                     "{} · {}",
-                    last.name,
+                    last.record.name,
                     ui.app.model.group_name(last.group_id).unwrap()
                 );
                 let ids = ui.app.model.entries.iter().map(|e| e.id).collect();
@@ -318,21 +312,17 @@ fn delete_confirmation_tail_is_correct_on_the_first_scaled_frame() {
 #[test]
 fn idle_frames_do_not_save_and_new_group_keeps_its_ui_identity_after_commit() {
     let mut ui = GroupUi::new();
-    ui.use_memory_vault(bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME));
+    ui.use_memory_vault(bnauth_core::VaultSnapshot::new_empty());
     for _ in 0..20 {
-        let token = ui.app.model.change_token();
-        ui.app.persist_frame_changes(token, &ui.ctx);
+        ui.frame(Vec::new());
         assert!(!ui.app.runtime.app.saving);
     }
-    assert_eq!(ui.app.runtime.app.current.as_ref().unwrap().revision, 0);
-    let token = ui.app.model.change_token();
-    let id = ui.app.model.add_group("保存後保持分組").unwrap();
-    ui.app.persist_frame_changes(token, &ui.ctx);
+    assert_eq!(ui.app.runtime.app.current.as_deref().unwrap().revision, 0);
+    let id = ui.submit_group("保存後保持分組");
     wait_runtime(&mut ui);
     assert_eq!(ui.app.model.group_name(id), Some("保存後保持分組"));
-    assert_eq!(ui.app.runtime.app.current.as_ref().unwrap().revision, 1);
-    let token = ui.app.model.change_token();
-    ui.app.persist_frame_changes(token, &ui.ctx);
+    assert_eq!(ui.app.runtime.app.current.as_deref().unwrap().revision, 1);
+    ui.frame(Vec::new());
     assert!(!ui.app.runtime.app.saving);
 }
 
@@ -344,7 +334,7 @@ impl bnauth_app::Repository for CleanupFailureRepository {
     fn state(&self) -> bnauth_app::RepositoryState {
         bnauth_app::RepositoryState {
             cleanup_required: self.cleanup_required,
-            blocked: false,
+            ..Default::default()
         }
     }
     fn commit(
@@ -355,15 +345,19 @@ impl bnauth_app::Repository for CleanupFailureRepository {
         Err("人工保存與清理失敗".into())
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
+        panic!("discard must not remove the temporary file")
+    }
+    fn defer_cleanup(&mut self) {
         self.cleanup_required = false;
-        Ok(())
     }
 }
 
 #[test]
-fn discard_restores_model_but_keeps_cleanup_ui_until_cleanup_succeeds() {
+fn discarding_failed_group_changes_keeps_original_rows_and_allows_close() {
     let mut ui = GroupUi::new();
-    let vault = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+    let mut model = VaultModel::from_snapshot(&bnauth_core::VaultSnapshot::new_empty());
+    model.add_test_entry("既有驗證器", "", 0).unwrap();
+    let vault = model.snapshot();
     ui.use_memory_vault(vault.clone());
     ui.app.runtime.app = bnauth_app::Application::start(Box::new(move || {
         Ok((
@@ -374,22 +368,39 @@ fn discard_restores_model_but_keeps_cleanup_ui_until_cleanup_succeeds() {
         ))
     }));
     wait_runtime(&mut ui);
+    let code = ui
+        .app
+        .otp_cache
+        .code(&ui.app.model.entries[0].record, IMPORT_TEST_TIME);
+    let calculations = ui.app.otp_cache.calculations;
     let token = ui.app.model.change_token();
-    ui.app.model.add_group("不能保存的分組").unwrap();
-    ui.app.persist_frame_changes(token, &ui.ctx);
+    ui.open(Dialog::groups(&ui.app.model));
+    ui.click(ui.point("輸入名稱後按 Enter 新增"));
+    ui.type_text("不能保存的分組");
+    ui.click(ui.point("套用"));
     wait_runtime(&mut ui);
+    assert!(ui.app.runtime.app.has_pending());
+    assert_eq!(ui.app.model.change_token(), token);
     ui.view = TestView::Saving;
     for _ in 0..3 {
         ui.frame(Vec::new());
     }
-    ui.click(ui.point("放棄這次未保存變更"));
+    assert!(!ui.points(bnauth_core::WRITE_FAILED_NOTICE).is_empty());
+    ui.click(ui.point("放棄"));
     assert_eq!(ui.app.model.groups.len(), 1);
+    assert_eq!(ui.app.model.change_token(), token);
+    assert_eq!(
+        ui.app
+            .otp_cache
+            .code(&ui.app.model.entries[0].record, IMPORT_TEST_TIME),
+        code
+    );
+    assert_eq!(ui.app.otp_cache.calculations, calculations);
     let app = &ui.app.runtime.app;
+    assert_eq!(&ui.app.model.snapshot(), app.current.as_deref().unwrap());
     assert!(!app.has_pending());
-    assert!(app.repository_state.cleanup_required);
-    assert!(app.error.is_some());
-    assert!(!ui.points("仍有暫存檔未移除").is_empty());
-    assert!(ui.points("資料已保存").is_empty());
+    assert!(!app.repository_state.needs_attention());
+    assert!(app.error.is_none());
     let mut input = egui::RawInput::default();
     input
         .viewports
@@ -402,22 +413,24 @@ fn discard_restores_model_but_keeps_cleanup_ui_until_cleanup_succeeds() {
         eframe::App::logic(&mut ui.app, root.ctx(), &mut frame);
     });
     assert!(
-        output.viewport_output[&egui::ViewportId::ROOT]
+        !output.viewport_output[&egui::ViewportId::ROOT]
             .commands
             .contains(&egui::ViewportCommand::CancelClose)
     );
-    // Restore the saving page's hit-test layout after the close-only frame.
-    for _ in 0..3 {
-        ui.frame(Vec::new());
-    }
-    ui.click(ui.point("重試移除暫存檔"));
-    wait_runtime(&mut ui);
-    let app = &ui.app.runtime.app;
-    assert!(!app.repository_state.needs_attention());
-    assert!(app.error.is_none());
+    assert!(ui.app.runtime.close_requested);
 }
 
 impl GroupUi {
+    fn submit_group(&mut self, name: &str) -> u64 {
+        let mut draft = self.app.model.group_draft();
+        let id = draft.add_group(name).unwrap();
+        let runtime = &mut self.app.runtime;
+        let candidate = draft.snapshot(runtime.app.current.as_deref().unwrap());
+        runtime.commit_with_pending_clock(candidate, None).unwrap();
+        runtime.pending_groups = Some(Box::new(draft));
+        id
+    }
+
     fn new() -> Self {
         let ctx = egui::Context::default();
         let mut fonts = egui::FontDefinitions::empty();
@@ -443,8 +456,12 @@ impl GroupUi {
             .text_styles
             .insert(egui::TextStyle::Button, FontId::proportional(13.0));
         ctx.set_global_style(style);
-        let model = VaultModel::test_fixture();
+        let mut model = VaultModel::test_fixture();
         let runtime = crate::test_support::runtime(model.snapshot(), IMPORT_TEST_TIME);
+        let mut groups = Dialog::groups(&model);
+        if let Dialog::Groups { name, .. } = &mut groups {
+            *name = "新增草稿".into();
+        }
         let mut ui = Self {
             app: BnAuthApp {
                 window_chrome: crate::window_chrome::WindowChrome::default(),
@@ -453,12 +470,8 @@ impl GroupUi {
                 model,
                 group: 0,
                 query: String::new(),
-                selected: BTreeSet::new(),
-                dialog: Some(Dialog::Groups {
-                    name: "新增草稿".into(),
-                    rename: None,
-                    error: String::new(),
-                }),
+                selected: RowSelection::default(),
+                dialog: Some(groups),
                 notifications: crate::notifications::Notifications::default(),
                 runtime,
                 drag_origin: None,
@@ -466,6 +479,7 @@ impl GroupUi {
                 drop: None,
                 tab_reveal: Some(0),
                 tab_scroll: None,
+                tab_labels: TabLabels::default(),
             },
             ctx,
             time: 0.0,
@@ -513,7 +527,9 @@ impl GroupUi {
                 };
                 form.show(ui, &self.app.model);
             }
-            TestView::List => self.app.entry_list(ui),
+            TestView::List => {
+                self.app.entry_list(ui, false);
+            }
             TestView::Saving => self.app.saving_ui(ui),
         });
         // This harness inspects paint shapes without a GPU texture consumer.
@@ -535,6 +551,7 @@ impl GroupUi {
         // Fixture replacement starts a fresh model whose token may match the
         // previous one; unlike a production reload it does not apply_snapshot.
         self.app.projection = EntryProjection::default();
+        self.app.tab_labels = TabLabels::default();
         self.app.runtime = crate::test_support::runtime(vault, IMPORT_TEST_TIME);
     }
 
@@ -609,10 +626,19 @@ impl GroupUi {
     }
 
     fn group_point(&self, id: u64) -> Pos2 {
+        if matches!(&self.app.dialog, Some(Dialog::Groups { rename: Some(edit), .. }) if edit.id == id)
+        {
+            return self
+                .ctx
+                .read_response(DialogEditor::GroupRename.id())
+                .unwrap()
+                .rect
+                .center();
+        }
         self.point(&format!(
             "{}  ({})",
-            self.app.model.group_name(id).unwrap(),
-            self.app.model.group_count(id)
+            self.group_draft().group_name(id).unwrap(),
+            self.group_draft().group_count(id)
         ))
     }
 
@@ -669,6 +695,13 @@ impl GroupUi {
         self.frame(vec![egui::Event::Text(text.into())]);
     }
 
+    fn has_invalid_border(&self, editor: DialogEditor) -> bool {
+        let field = self.ctx.read_response(editor.id()).unwrap().rect;
+        self.shapes.iter().any(|shape| matches!(
+            &shape.shape, egui::Shape::Rect(rect) if rect.rect == field && rect.stroke.color == RED
+        ))
+    }
+
     fn rename(&self) -> &GroupRename {
         match self.app.dialog.as_ref() {
             Some(Dialog::Groups {
@@ -685,8 +718,19 @@ impl GroupUi {
         ));
     }
 
+    fn group_draft(&self) -> &GroupDraft {
+        match &self.app.dialog {
+            Some(Dialog::Groups { draft, .. }) => draft,
+            _ => panic!("Expected open group management"),
+        }
+    }
+
     fn order(&self) -> Vec<u64> {
-        self.app.model.groups.iter().map(|group| group.id).collect()
+        self.group_draft()
+            .groups
+            .iter()
+            .map(|group| group.id)
+            .collect()
     }
 }
 
@@ -726,12 +770,12 @@ fn about_github_click_requests_native_open_without_changing_data() {
     assert!(matches!(ui.app.dialog, Some(Dialog::Info)));
     assert_eq!(ui.app.model.change_token(), token);
     assert_eq!(ui.app.model.snapshot(), original);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
     assert!(!ui.app.runtime.app.saving && !ui.app.runtime.app.has_pending());
 }
 
 #[test]
-fn single_click_stays_put_double_click_selects_inline_name_and_enter_commits() {
+fn single_click_stays_put_double_click_selects_inline_name_and_enter_stages_rename() {
     let mut ui = GroupUi::new();
     ui.click(ui.group_point(1));
     ui.assert_idle_groups();
@@ -746,7 +790,8 @@ fn single_click_stays_put_double_click_selects_inline_name_and_enter_commits() {
     }
     ui.key(egui::Key::Enter);
     ui.assert_idle_groups();
-    assert_eq!(ui.app.model.group_name(1), Some("改名主帳號"));
+    assert_eq!(ui.group_draft().group_name(1), Some("改名主帳號"));
+    assert_eq!(ui.app.model.group_name(1), Some("主帳號"));
     assert_eq!(ui.app.group, 0);
     assert_eq!(ui.app.model.groups.len(), 5);
 }
@@ -771,26 +816,28 @@ fn backdrop_keeps_invalid_inline_draft_and_sorting_still_validates_it() {
     ui.type_text("主帳號");
     ui.click(Pos2::new(5.0, 5.0));
     assert_eq!(ui.rename().id, 2);
-    assert!(!ui.rename().error.is_empty());
+    assert!(ui.rename().error.duplicate && ui.rename().error.message.is_none());
     ui.click(ui.action_point(1, "↓"));
     assert_eq!(ui.order(), order);
+    assert_eq!(ui.group_draft().group_name(2), Some("遊戲帳號"));
     assert_eq!(ui.app.model.group_name(2), Some("遊戲帳號"));
-    assert!(!ui.rename().error.is_empty());
+    assert!(ui.rename().error.duplicate && ui.rename().error.message.is_none());
 }
 
 #[test]
-fn empty_name_blocks_delete_and_add_actions() {
+fn empty_name_blocks_deleting_another_group_and_adding_a_group() {
     let mut ui = GroupUi::new();
     let groups = ui.app.model.groups.clone();
     ui.edit_group(3);
     ui.key(egui::Key::Backspace);
     assert!(ui.rename().name.is_empty());
-    ui.click(ui.action_point(1, "刪除"));
-    assert!(!ui.rename().error.is_empty());
+    ui.click(ui.action_point(4, "刪除"));
+    assert!(ui.rename().error.message.is_some());
+    assert_eq!(ui.group_draft().groups, groups);
     assert_eq!(ui.app.model.groups, groups);
     ui.click(ui.point("新增草稿"));
     ui.key(egui::Key::Enter);
-    assert!(!ui.rename().error.is_empty());
+    assert!(ui.rename().error.message.is_some());
     assert_eq!(ui.app.model.groups, groups);
 }
 
@@ -806,8 +853,21 @@ fn sorting_above_and_below_editor_commits_the_correct_group_first() {
         ui.type_text(&name);
         ui.click(ui.action_point(moving, arrow));
         ui.assert_idle_groups();
-        assert_eq!(ui.app.model.group_name(editing), Some(name.as_str()));
+        assert_eq!(ui.group_draft().group_name(editing), Some(name.as_str()));
+        assert_ne!(ui.app.model.group_name(editing), Some(name.as_str()));
         assert_eq!(ui.order(), expected_order);
+        let at_edge = if arrow == "↑" {
+            expected_order[1]
+        } else {
+            *expected_order.last().unwrap()
+        };
+        let revision = ui.group_draft().change_token();
+        ui.click(ui.action_point(at_edge, arrow));
+        assert_eq!(ui.order(), expected_order);
+        assert_eq!(ui.group_draft().change_token(), revision);
+        assert!(
+            matches!(&ui.app.dialog, Some(Dialog::Groups { error, .. }) if error.message.is_none())
+        );
     }
 }
 
@@ -819,10 +879,10 @@ fn enter_adds_group_clears_draft_and_keeps_focus_for_the_next_group() {
     ui.click(ui.point("新增草稿"));
     ui.key(egui::Key::Enter);
     ui.assert_idle_groups();
-    assert_eq!(ui.app.model.groups.len(), 6);
-    assert_eq!(ui.app.model.groups.last().unwrap().name, "新增草稿");
+    assert_eq!(ui.group_draft().groups.len(), 6);
+    assert_eq!(ui.group_draft().groups.last().unwrap().name, "新增草稿");
     assert!(
-        matches!(ui.app.dialog, Some(Dialog::Groups { ref name, ref error, .. }) if name.is_empty() && error.is_empty())
+        matches!(ui.app.dialog, Some(Dialog::Groups { ref name, ref error, .. }) if name.is_empty() && !error.duplicate && error.message.is_none())
     );
     // No second click: typing must go to the freshly cleared input.
     ui.type_text("第二個新分組");
@@ -830,9 +890,17 @@ fn enter_adds_group_clears_draft_and_keeps_focus_for_the_next_group() {
         matches!(ui.app.dialog, Some(Dialog::Groups { ref name, .. }) if name == "第二個新分組")
     );
     ui.key(egui::Key::Enter);
+    assert_eq!(ui.group_draft().groups.len(), 7);
+    assert_eq!(ui.group_draft().groups.last().unwrap().name, "第二個新分組");
+    assert_eq!(ui.app.model.groups.len(), 5);
+    assert!(!ui.app.runtime.app.has_pending());
+    assert_eq!(ui.app.group, 0);
+    ui.click(ui.point("套用"));
+    wait_runtime(&mut ui);
+    assert!(ui.app.dialog.is_none());
     assert_eq!(ui.app.model.groups.len(), 7);
     assert_eq!(ui.app.model.groups.last().unwrap().name, "第二個新分組");
-    assert_eq!(ui.app.group, 0);
+    assert_eq!(ui.app.runtime.app.current.as_deref().unwrap().revision, 1);
 }
 
 #[test]
@@ -845,6 +913,7 @@ fn enter_add_rejects_blank_duplicate_and_group_limit_without_losing_draft() {
                 ui.app.model.add_group(&name).unwrap();
             }
             ui.size = Vec2::new(400.0, 1600.0);
+            ui.open(Dialog::groups(&ui.app.model));
         }
         if let Some(Dialog::Groups { name, .. }) = &mut ui.app.dialog {
             *name = draft.into();
@@ -863,7 +932,7 @@ fn enter_add_rejects_blank_duplicate_and_group_limit_without_losing_draft() {
         ui.assert_idle_groups();
         assert_eq!(ui.app.model.groups, groups);
         assert!(
-            matches!(ui.app.dialog, Some(Dialog::Groups { ref name, ref error, .. }) if name == draft && !error.is_empty())
+            matches!(ui.app.dialog, Some(Dialog::Groups { ref name, ref error, .. }) if name == draft && (error.duplicate || error.message.is_some()))
         );
         // A keystroke after rejection still edits the input, rather than being dropped.
         ui.type_text("x");
@@ -874,23 +943,18 @@ fn enter_add_rejects_blank_duplicate_and_group_limit_without_losing_draft() {
 }
 
 #[test]
-fn close_button_commits_valid_inline_name_and_rejects_invalid_name() {
-    let mut ui = GroupUi::new();
-    ui.edit_group(1);
-    ui.type_text("關閉時保存");
-    ui.click(ui.point("×"));
-    assert!(ui.app.dialog.is_none());
-    assert_eq!(ui.app.model.group_name(1), Some("關閉時保存"));
-
-    let mut ui = GroupUi::new();
-    ui.edit_group(1);
-    ui.type_text("遊戲帳號");
-    ui.click(ui.point("×"));
-    assert!(!ui.rename().error.is_empty());
-    assert_eq!(ui.app.model.group_name(1), Some("主帳號"));
-    ui.key(egui::Key::Escape);
-    ui.click(ui.point("×"));
-    assert!(ui.app.dialog.is_none());
+fn close_discards_staged_order_and_valid_or_invalid_inline_name() {
+    for (name, close) in [("關閉時放棄", "取消"), ("遊戲帳號", "×")] {
+        let mut ui = GroupUi::new();
+        let original = ui.app.model.snapshot();
+        ui.click(ui.action_point(1, "↓"));
+        ui.edit_group(1);
+        ui.type_text(name);
+        ui.click(ui.point(close));
+        assert!(ui.app.dialog.is_none());
+        assert_eq!(ui.app.model.snapshot(), original);
+        assert!(!ui.app.runtime.app.has_pending());
+    }
 }
 
 #[test]
@@ -901,6 +965,7 @@ fn twenty_groups_scroll_under_a_fixed_header_and_close_button() {
         ui.app.model.add_group(&name).unwrap();
     }
     ui.size = Vec2::new(400.0, 420.0);
+    ui.open(Dialog::groups(&ui.app.model));
     for _ in 0..4 {
         ui.frame(Vec::new());
     }
@@ -920,8 +985,8 @@ fn twenty_groups_scroll_under_a_fixed_header_and_close_button() {
     for _ in 0..24 {
         ui.frame(Vec::new());
     }
-    assert!(ui.points("未分組  (8)").is_empty());
-    assert!(ui.points("新增草稿").len() == 1);
+    assert!(ui.points("預設  (8)").is_empty());
+    assert_eq!(ui.points("輸入名稱後按 Enter 新增").len(), 1);
     assert!((ui.point("×") - close).length() < 1.0);
     assert!((ui.point("分組管理") - heading).length() < 1.0);
     ui.click(ui.point("×"));
@@ -932,17 +997,12 @@ fn twenty_groups_scroll_under_a_fixed_header_and_close_button() {
 fn authenticator_details_scroll_under_a_fixed_header_and_close_button() {
     let mut ui = GroupUi::new();
     let entry = &mut ui.app.model.entries[0];
-    entry.description = "足夠長的備註，用來確認只有內容隨捲動移動。\n".repeat(30);
+    entry.record.description = "足夠長的備註，用來確認只有內容隨捲動移動。\n".repeat(30);
     let id = entry.id;
-    let name = entry.name.clone();
-    let secret = entry
-        .record
-        .secret
-        .as_ref()
-        .unwrap()
-        .hex()
-        .to_ascii_uppercase();
-    ui.app.dialog = Some(Dialog::Details(id));
+    let name = entry.record.name.clone();
+    let secret = entry.record.secret.hex().to_ascii_uppercase();
+    ui.app.model.snapshot();
+    ui.app.dialog = Some(Dialog::details(&ui.app.model, &ui.app.model.entries[0]));
     ui.size = Vec2::new(320.0, 420.0);
     for _ in 0..4 {
         ui.frame(Vec::new());
@@ -980,9 +1040,13 @@ fn abrupt_dialog_resizes_recenter_in_the_same_frame_without_repeating_stable_pas
         let mut ui = GroupUi::new();
         let (dialog, title) = match kind {
             0 => {
-                ui.app.model.entries[0].description =
+                ui.app.model.entries[0].record.description =
                     "長備註，用來驗證縮小後的第一幀。\n".repeat(30);
-                (Dialog::Details(1_001), "驗證器資料")
+                ui.app.model.snapshot();
+                (
+                    Dialog::details(&ui.app.model, &ui.app.model.entries[0]),
+                    "驗證器資料",
+                )
             }
             1 => {
                 while ui.app.model.groups.len() < 20 {
@@ -991,14 +1055,7 @@ fn abrupt_dialog_resizes_recenter_in_the_same_frame_without_repeating_stable_pas
                         .add_group(&format!("填充分組{}", ui.app.model.groups.len()))
                         .unwrap();
                 }
-                (
-                    Dialog::Groups {
-                        name: String::new(),
-                        rename: None,
-                        error: String::new(),
-                    },
-                    "分組管理",
-                )
+                (Dialog::groups(&ui.app.model), "分組管理")
             }
             _ => {
                 // Exercise both one-line and wrapped headings as the width changes.
@@ -1049,39 +1106,15 @@ fn abrupt_dialog_resizes_recenter_in_the_same_frame_without_repeating_stable_pas
 }
 
 #[test]
-fn dialog_resize_and_enter_add_a_group_only_once() {
-    let mut ui = GroupUi::new();
-    ui.click(ui.point("新增草稿"));
-    let groups_before = ui.app.model.groups.len();
-    let token_before = ui.app.model.change_token();
-    ui.size = Vec2::new(320.0, 860.0);
-    ui.frame(vec![egui::Event::Key {
-        key: egui::Key::Enter,
-        physical_key: Some(egui::Key::Enter),
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::NONE,
-    }]);
-    assert_eq!(ui.passes, 2);
-    assert_eq!(ui.app.model.groups.len(), groups_before + 1);
-    assert_eq!(ui.app.model.change_token(), token_before + 1);
-    let Some(Dialog::Groups { name, error, .. }) = &ui.app.dialog else {
-        panic!("group dialog must remain open");
-    };
-    assert!(name.is_empty() && error.is_empty());
-}
-
-#[test]
 fn every_dialog_ignores_backdrop_and_escape_and_has_a_visible_close_button() {
     for width in [320.0, 400.0] {
-        let vault = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+        let vault = bnauth_core::VaultSnapshot::new_empty();
         let mut preview = import_draft();
-        preview
-            .prepare_preview(&vault, vault.groups[0].id, IMPORT_TEST_TIME)
-            .unwrap();
+        preview.prepare_preview(&vault, vault.groups[0].id).unwrap();
+        let model = VaultModel::test_fixture();
         let dialogs = [
             (Dialog::Import(Box::new(import_draft())), "匯入驗證器"),
-            (Dialog::Import(Box::new(preview)), "預覽匯入"),
+            (Dialog::Import(Box::new(preview)), "匯入驗證器"),
             (
                 Dialog::Edit {
                     id: 1_001,
@@ -1089,19 +1122,11 @@ fn every_dialog_ignores_backdrop_and_escape_and_has_a_visible_close_button() {
                     description: "保留備註".into(),
                     error: String::new(),
                 },
-                "編輯標題與說明",
+                "編輯名稱與備註",
             ),
-            (Dialog::Details(1_001), "驗證器資料"),
+            (Dialog::details(&model, &model.entries[0]), "驗證器資料"),
             (Dialog::delete(vec![1_001]), "確定要刪除下列驗證器？"),
-            (
-                Dialog::Groups {
-                    name: "分組草稿".into(),
-                    rename: None,
-                    error: String::new(),
-                },
-                "分組管理",
-            ),
-            (Dialog::DeleteGroup(1), "刪除分組？"),
+            (Dialog::groups(&model), "分組管理"),
             (Dialog::Info, "BNAuth"),
         ];
         for (dialog, title) in dialogs {
@@ -1119,7 +1144,18 @@ fn every_dialog_ignores_backdrop_and_escape_and_has_a_visible_close_button() {
                 (close - expected).length() <= 1.5,
                 "{title} at width {width}: close center {close:?} must be at the content's top-right {expected:?}, content={content:?}"
             );
-            assert!(ui.points("取消").is_empty());
+            let cancel_visible = match ui.app.dialog.as_ref() {
+                Some(Dialog::Groups { .. }) => true,
+                Some(Dialog::Import(form)) if form.preview.is_some() => {
+                    !ui.points("確認").is_empty()
+                }
+                _ => false,
+            };
+            assert_eq!(
+                !ui.points("取消").is_empty(),
+                cancel_visible,
+                "{title} at width {width}"
+            );
             assert!(ui.points("返回").is_empty());
             ui.click(Pos2::new(5.0, 5.0));
             assert_eq!(
@@ -1154,15 +1190,25 @@ fn every_dialog_ignores_backdrop_and_escape_and_has_a_visible_close_button() {
 }
 
 #[test]
-fn import_draft_and_preview_survive_outside_input_then_navigation_and_commit_work() {
+fn import_draft_and_preview_survive_outside_input_and_require_confirmation_to_save() {
     let mut ui = GroupUi::new();
-    ui.use_memory_vault(bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME));
+    let mut original = bnauth_core::VaultSnapshot::new_empty();
+    let destination = uuid::Uuid::new_v4();
+    original.groups.push(bnauth_core::Group {
+        id: destination,
+        name: "PTR".into(),
+        sort_order: 1,
+        is_ungrouped: false,
+    });
+    ui.use_memory_vault(original.clone());
+    ui.app.runtime.frame_time = 59_000;
     ui.open(Dialog::Import(Box::new(import_draft())));
     let expected = import_draft();
     for previewing in [false, true] {
         if previewing {
             ui.click(ui.point("預覽匯入"));
-            assert_eq!(ui.points("預覽匯入").len(), 1);
+            assert_eq!(ui.points("匯入驗證器").len(), 1);
+            assert_eq!(ui.points("名稱 *").len(), 1);
         }
         let preview = ui.import().preview.clone();
         assert_eq!(preview.is_some(), previewing);
@@ -1175,22 +1221,64 @@ fn import_draft_and_preview_survive_outside_input_then_navigation_and_commit_wor
         assert_eq!(actual.serial, expected.serial);
         assert_eq!(actual.restore, expected.restore);
         assert_eq!(actual.group, expected.group);
-        assert_eq!(actual.preview, preview);
+        assert!(actual.preview == preview);
     }
-    ui.click(ui.point("返回修改"));
-    assert!(ui.import().preview.is_none());
+    let preview = ui.import().preview.clone();
+    ui.click(ui.point("名稱 *") + Vec2::new(0.0, 24.0));
+    ui.key(egui::Key::End);
+    ui.type_text("!");
+    ui.click(ui.point("備註") + Vec2::new(0.0, 24.0));
+    ui.key(egui::Key::End);
+    ui.type_text("!");
     assert_eq!(ui.import().secret, expected.secret);
     assert_eq!(ui.import().restore, expected.restore);
     assert_eq!(ui.points("匯入驗證器").len(), 1);
-    ui.click(ui.point("預覽匯入"));
-    ui.click(ui.point("確認匯入並保存"));
+    assert!(ui.import().preview == preview);
+    assert_eq!(ui.points("9428 7082").len(), 1);
+
+    ui.ctx
+        .memory_mut(|memory| memory.request_focus(DialogEditor::ImportRestore.id()));
+    let mut reached_group = false;
+    let mut reached_cancel = false;
+    let mut reached_confirmation = false;
+    for _ in 0..6 {
+        ui.key(egui::Key::Tab);
+        let focused = ui
+            .ctx
+            .memory(|memory| memory.focused())
+            .and_then(|id| ui.ctx.read_response(id))
+            .expect("keyboard focus in the import dialog");
+        if focused.rect.contains(ui.point("預設")) {
+            reached_group = true;
+        }
+        if focused.rect.contains(ui.point("取消")) {
+            assert!(reached_group);
+            reached_cancel = true;
+        }
+        if focused.rect.contains(ui.point("確認")) {
+            reached_confirmation = true;
+            break;
+        }
+    }
+    assert!(reached_group && reached_cancel && reached_confirmation);
+
+    ui.click(ui.point("預設"));
+    ui.click(ui.point("PTR"));
+    assert!(ui.import().preview == preview);
+    assert_eq!(ui.points("9428 7082").len(), 1);
+    assert_import_preview_is_read_only(&mut ui, &original);
+    ui.click(ui.point("確認"));
     assert!(ui.app.dialog.is_none());
     let runtime = &mut ui.app.runtime;
     drain_memory_app(&mut runtime.app);
-    let saved = runtime.app.current.clone().unwrap();
+    let saved = runtime.app.current.as_deref().unwrap().clone();
     assert_eq!(saved.authenticators.len(), 1);
-    assert_eq!(saved.authenticators[0].name, expected.name);
-    assert_eq!(saved.authenticators[0].description, expected.description);
+    assert_eq!(saved.authenticators[0].group_id, destination);
+    assert_eq!(saved.authenticators[0].name, format!("{}!", expected.name));
+    assert_eq!(
+        saved.authenticators[0].description,
+        format!("{}!", expected.description)
+    );
     assert_eq!(
         saved.authenticators[0].restore_code.as_deref(),
         Some(expected.restore.as_str())
@@ -1199,18 +1287,37 @@ fn import_draft_and_preview_survive_outside_input_then_navigation_and_commit_wor
     assert!(runtime.sync_rx.is_none());
     ui.app.model.apply_snapshot(&saved);
 
-    // A duplicate preview can complete without creating a second record or another save.
+    // A duplicate preview is read-only until the user accepts the reminder.
     ui.open(Dialog::Import(Box::new(import_draft())));
     ui.click(ui.point("預覽匯入"));
-    assert!(!ui.import().preview.as_ref().unwrap().changed);
-    ui.click(ui.point("完成（未變更）"));
+    assert_eq!(ui.points("「PTR」的「人工匯入草稿!」").len(), 1);
+    assert_import_preview_is_read_only(&mut ui, &saved);
+    ui.click(ui.point("取消"));
     assert!(ui.app.dialog.is_none());
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&saved));
+    assert_import_preview_is_read_only(&mut ui, &saved);
+
+    ui.open(Dialog::Import(Box::new(import_draft())));
+    ui.click(ui.point("預覽匯入"));
+    ui.click(ui.point("確認"));
+    assert!(ui.app.dialog.is_none());
+    let runtime = &mut ui.app.runtime;
+    assert!(runtime.app.has_pending());
+    assert_eq!(runtime.app.current.as_deref(), Some(&saved));
+    drain_memory_app(&mut runtime.app);
+    let updated = runtime.app.current.as_deref().unwrap();
+    assert_eq!(updated.revision, saved.revision + 1);
+    assert_eq!(updated.authenticators.len(), 2);
+    assert_eq!(updated.authenticators[0], saved.authenticators[0]);
+    assert_ne!(updated.authenticators[1].id, saved.authenticators[0].id);
+    assert_eq!(
+        updated.authenticators[1].secret,
+        saved.authenticators[0].secret
+    );
 }
 
-fn assert_import_preview_is_read_only(ui: &GroupUi, saved: &bnauth_core::VaultSnapshot) {
+fn assert_import_preview_is_read_only(ui: &mut GroupUi, saved: &bnauth_core::VaultSnapshot) {
     let runtime = &ui.app.runtime;
-    assert_eq!(runtime.app.current.as_ref(), Some(saved));
+    assert_eq!(runtime.app.current.as_deref(), Some(saved));
     assert_eq!(runtime.app.phase, bnauth_app::Phase::Ready);
     assert!(!runtime.app.has_pending());
     assert!(!runtime.app.saving);
@@ -1222,57 +1329,78 @@ fn assert_import_preview_is_read_only(ui: &GroupUi, saved: &bnauth_core::VaultSn
 #[test]
 fn import_preview_code_uses_shared_time_across_forward_and_backward_steps_without_saving() {
     let mut ui = GroupUi::new();
-    let saved = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+    let saved = bnauth_core::VaultSnapshot::new_empty();
     ui.use_memory_vault(saved.clone());
     ui.app.runtime.frame_time = 59_000;
+    ui.size = Vec2::new(400.0, 572.0);
     ui.open(Dialog::Import(Box::new(import_draft())));
-    assert!(ui.points("目前驗證碼").is_empty());
+    assert!(ui.points("9428 7082").is_empty());
     ui.click(ui.point("預覽匯入"));
+    let destination_label = ui.point("匯入至");
+    let dropdown = ui.point("預設");
+    let cancel = ui.point("取消");
+    let confirm = ui.point("確認");
+    assert!(
+        (destination_label.y - dropdown.y).abs() < 2.0,
+        "{destination_label:?} {dropdown:?}"
+    );
+    assert!(
+        (dropdown.y - confirm.y).abs() < 2.0,
+        "{dropdown:?} {confirm:?}"
+    );
+    assert!(destination_label.x < dropdown.x && dropdown.x < cancel.x);
+    assert!(cancel.x < confirm.x && confirm.x - cancel.x < 64.0);
+    assert!((cancel.y - confirm.y).abs() < 2.0);
 
     // RFC6238's public SHA1 seed at 59 seconds; the harness/UI time and the
     // system clock deliberately do not match this shared application time.
-    for (time, code, remaining) in [
-        (59_000, "9428 7082", "剩餘 1 秒"),
-        (59_999, "9428 7082", "剩餘 1 秒"),
-        (60_000, "3735 9152", "剩餘 30 秒"),
-        (59_000, "9428 7082", "剩餘 1 秒"),
+    for (time, code, filled) in [
+        (59_000, "9428 7082", true),
+        (59_999, "9428 7082", true),
+        (60_000, "3735 9152", false),
+        (59_000, "9428 7082", true),
     ] {
         ui.app.runtime.frame_time = time;
         ui.frame(Vec::new());
-        assert_eq!(ui.points("目前驗證碼").len(), 1);
         assert_eq!(ui.points(code).len(), 1, "preview code at {time} ms");
-        assert_eq!(ui.points(remaining).len(), 1);
-        assert_import_preview_is_read_only(&ui, &saved);
+        let bar = ui
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == ACCENT && rect.rect.height() == 4.0 => {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("preview progress bar");
+        assert!(bar.top() > ui.point(code).y);
+        assert!(bar.bottom() < ui.point("確認").y);
+        assert_eq!(bar.width() > 100.0, filled);
+        assert_import_preview_is_read_only(&mut ui, &saved);
     }
     ui.app.runtime.frame_time = -1;
     ui.frame(Vec::new());
-    assert_eq!(ui.points("無法產生驗證碼，請檢查系統時間。").len(), 1);
+    assert_eq!(
+        ui.points("E13：時間異常\n時間偏差過大，無法產生正確驗證碼。")
+            .len(),
+        1
+    );
     assert!(ui.points("9428 7082").is_empty());
     assert!(ui.points("3735 9152").is_empty());
-    assert_import_preview_is_read_only(&ui, &saved);
+    assert_import_preview_is_read_only(&mut ui, &saved);
 }
 
 #[test]
-fn import_preview_code_recomputes_after_returning_to_edit_the_secret() {
+fn import_preview_code_recomputes_after_editing_the_secret_in_place() {
     let mut ui = GroupUi::new();
-    let saved = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+    let saved = bnauth_core::VaultSnapshot::new_empty();
     ui.use_memory_vault(saved.clone());
     ui.app.runtime.frame_time = 59_000;
     ui.open(Dialog::Import(Box::new(import_draft())));
     ui.click(ui.point("預覽匯入"));
     assert_eq!(ui.points("9428 7082").len(), 1);
-    let first_id = ui
-        .import()
-        .preview
-        .as_ref()
-        .unwrap()
-        .candidate
-        .authenticators[0]
-        .id;
+    let first_key = ui.import().preview.as_ref().unwrap().secret.clone();
 
-    ui.click(ui.point("返回修改"));
-    assert!(ui.import().preview.is_none());
-    assert!(ui.points("目前驗證碼").is_empty());
     let replacement = "11".repeat(20);
     let expected = bnauth_core::totp(
         &bnauth_core::Secret::from_hex(&replacement).unwrap(),
@@ -1280,73 +1408,97 @@ fn import_preview_code_recomputes_after_returning_to_edit_the_secret() {
     )
     .unwrap();
     assert_ne!(expected, "94287082");
-    let Some(Dialog::Import(form)) = &mut ui.app.dialog else {
-        panic!("missing import draft");
-    };
-    form.secret = replacement;
-    ui.frame(Vec::new());
+    ui.click(ui.point("密鑰 *") + Vec2::new(0.0, 24.0));
+    ui.frame(vec![egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: Some(egui::Key::A),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    }]);
+    ui.type_text(&replacement);
+    assert!(ui.import().preview.is_none());
+    assert!(ui.points("9428 7082").is_empty());
+    assert!(ui.points("確認").is_empty());
     ui.click(ui.point("預覽匯入"));
-    assert_ne!(
-        ui.import()
-            .preview
-            .as_ref()
-            .unwrap()
-            .candidate
-            .authenticators[0]
-            .id,
-        first_id
-    );
+    assert_ne!(ui.import().preview.as_ref().unwrap().secret, first_key);
     assert_eq!(
         ui.points(&format!("{} {}", &expected[..4], &expected[4..]))
             .len(),
         1
     );
     assert!(ui.points("9428 7082").is_empty());
-    assert_eq!(ui.points("剩餘 1 秒").len(), 1);
-    assert_import_preview_is_read_only(&ui, &saved);
+    assert_import_preview_is_read_only(&mut ui, &saved);
 }
 
 #[test]
-fn import_preview_code_selects_the_existing_duplicate_instead_of_the_last_record() {
+fn import_preview_shows_the_candidate_code_and_up_to_five_duplicate_names() {
     let draft = import_draft();
-    let empty = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+    let mut empty = bnauth_core::VaultSnapshot::new_empty();
+    let group = uuid::Uuid::new_v4();
+    empty.groups.push(bnauth_core::Group {
+        id: group,
+        name: "其他分組".into(),
+        sort_order: 1,
+        is_ungrouped: false,
+    });
     let first = bnauth_core::prepare_import(
         &empty,
+        "不同密鑰的驗證器",
+        "",
+        empty.groups[0].id,
+        bnauth_core::parse_manual(&"11".repeat(20), "", "").unwrap(),
+    )
+    .unwrap()
+    .candidate(&empty)
+    .unwrap();
+    let mut saved = bnauth_core::prepare_import(
+        &first,
         "既有RFC驗證器",
         &draft.description,
-        empty.groups[0].id,
+        group,
         bnauth_core::parse_manual(&draft.secret, &draft.serial, &draft.restore).unwrap(),
-        IMPORT_TEST_TIME,
     )
     .unwrap()
-    .candidate;
-    let saved = bnauth_core::prepare_import(
-        &first,
-        "最後一筆不同密鑰",
-        "",
-        first.groups[0].id,
-        bnauth_core::parse_manual(&"11".repeat(20), "", "").unwrap(),
-        IMPORT_TEST_TIME,
-    )
-    .unwrap()
-    .candidate;
-    let existing = saved.authenticators[0].id;
+    .candidate(&first)
+    .unwrap();
+    for index in 1..=5 {
+        let mut record = saved.authenticators[1].clone();
+        record.id = uuid::Uuid::new_v4();
+        record.name = format!("既有RFC驗證器 {index}");
+        record.sort_order = index;
+        saved.authenticators.push(record);
+    }
     let mut ui = GroupUi::new();
     ui.use_memory_vault(saved.clone());
     ui.app.runtime.frame_time = 59_000;
-    let wrong_code = ui.app.otp_cache.code(&saved.authenticators[1], 59_000);
+    let wrong_code = ui.app.otp_cache.code(&saved.authenticators[0], 59_000);
     assert_ne!(wrong_code, "94287082");
     ui.open(Dialog::Import(Box::new(draft)));
     ui.click(ui.point("預覽匯入"));
     let preview = ui.import().preview.as_ref().unwrap();
-    assert_eq!(preview.existing_id, Some(existing));
-    assert!(!preview.changed);
+    assert_eq!(
+        preview
+            .record(&ui.import().name, &ui.import().description)
+            .group_id,
+        saved.groups[0].id
+    );
+    assert_eq!(preview.matches.len(), 5);
+    assert_eq!(ui.points("此驗證器密鑰與下列相同：").len(), 1);
+    for record in &saved.authenticators[1..=5] {
+        assert_eq!(
+            ui.points(&format!("「其他分組」的「{}」", record.name))
+                .len(),
+            1
+        );
+    }
+    assert!(ui.points("「其他分組」的「既有RFC驗證器 5」").is_empty());
     assert_eq!(ui.points("9428 7082").len(), 1);
     assert!(
         ui.points(&format!("{} {}", &wrong_code[..4], &wrong_code[4..]))
             .is_empty()
     );
-    assert_import_preview_is_read_only(&ui, &saved);
+    assert_import_preview_is_read_only(&mut ui, &saved);
 }
 
 #[test]
@@ -1361,19 +1513,50 @@ fn successful_edit_and_delete_actions_still_finish_their_dialogs() {
     });
     ui.click(ui.point("套用"));
     assert!(ui.app.dialog.is_none());
+    wait_runtime(&mut ui);
     let entry = ui.app.model.entry(id).unwrap();
-    assert_eq!(entry.name, "套用後名稱");
-    assert_eq!(entry.description, "套用後備註");
+    assert_eq!(entry.record.name, "套用後名稱");
+    assert_eq!(entry.record.description, "套用後備註");
     ui.open(Dialog::delete(vec![id]));
-    ui.click(ui.point("確認刪除"));
+    ui.click(ui.point("確認"));
     assert!(ui.app.dialog.is_none());
+    wait_runtime(&mut ui);
     assert!(ui.app.model.entry(id).is_none());
-    let total = ui.app.model.entries.len();
-    let ungrouped = ui.app.model.group_count(0) + ui.app.model.group_count(1);
-    ui.open(Dialog::DeleteGroup(1));
-    ui.click(ui.point("確認刪除分組"));
+    // Start the group workflow with the previous record edit and deletion saved.
+    let vault = ui.app.model.snapshot();
+    ui.use_memory_vault(vault);
+    let entries = ui.app.model.entries.clone();
+    let nonempty = ui.app.model.groups[1].id;
+    let empty = ui.app.model.groups[4].id;
+    ui.app.switch_group(empty);
+    ui.open(Dialog::groups(&ui.app.model));
+    ui.click(ui.action_point(nonempty, "刪除"));
+    ui.assert_idle_groups();
+    assert!(ui.group_draft().group_name(nonempty).is_some());
+    ui.edit_group(empty);
+    ui.key(egui::Key::Backspace);
+    assert!(ui.rename().name.is_empty());
+    ui.click(ui.action_point(empty, "刪除"));
+    ui.assert_idle_groups();
+    assert!(ui.group_draft().group_name(empty).is_none());
+    assert!(ui.app.model.group_name(empty).is_some());
+    assert_eq!(ui.app.group, empty);
+    ui.click(ui.point("取消"));
     assert!(ui.app.dialog.is_none());
-    assert_eq!(ui.app.model.group_name(1), None);
-    assert_eq!(ui.app.model.entries.len(), total);
-    assert_eq!(ui.app.model.group_count(0), ungrouped);
+    assert!(!ui.app.runtime.app.has_pending());
+    ui.open(Dialog::groups(&ui.app.model));
+    ui.edit_group(empty);
+    let duplicate = ui.app.model.group_name(nonempty).unwrap().to_owned();
+    ui.type_text(&duplicate);
+    assert!(ui.rename().error.duplicate);
+    ui.click(ui.action_point(empty, "刪除"));
+    ui.assert_idle_groups();
+    assert!(ui.group_draft().group_name(empty).is_none());
+    assert!(ui.app.model.group_name(empty).is_some());
+    ui.click(ui.point("套用"));
+    wait_runtime(&mut ui);
+    assert!(ui.app.dialog.is_none());
+    assert!(ui.app.model.group_name(empty).is_none());
+    assert_eq!(ui.app.group, 0);
+    assert_eq!(ui.app.model.entries, entries);
 }

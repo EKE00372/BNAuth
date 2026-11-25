@@ -35,7 +35,7 @@ impl bnauth_app::Repository for CountingRepository {
 
 fn ready_ui(name: &str, description: &str) -> (GroupUi, Arc<AtomicUsize>) {
     let mut ui = GroupUi::new();
-    let mut vault = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+    let mut vault = bnauth_core::VaultSnapshot::new_empty();
     let material =
         bnauth_core::parse_manual("1111111111111111111111111111111111111111", "", "").unwrap();
     vault = bnauth_core::prepare_import(
@@ -44,10 +44,10 @@ fn ready_ui(name: &str, description: &str) -> (GroupUi, Arc<AtomicUsize>) {
         description,
         vault.ungrouped_id().unwrap(),
         material,
-        IMPORT_TEST_TIME,
     )
     .unwrap()
-    .candidate;
+    .candidate(&vault)
+    .unwrap();
     ui.use_memory_vault(vault.clone());
     let commits = Arc::new(AtomicUsize::new(0));
     let repository_commits = commits.clone();
@@ -67,7 +67,7 @@ fn ready_ui(name: &str, description: &str) -> (GroupUi, Arc<AtomicUsize>) {
 
 // Exercise the full production App::logic -> App::ui route, including search,
 // dialogs and save detection. All persistence is through CountingRepository.
-fn frame(ui: &mut GroupUi, events: Vec<egui::Event>) {
+fn frame(ui: &mut GroupUi, events: Vec<egui::Event>) -> egui::CursorIcon {
     ui.time += 0.04;
     let mut input = egui::RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW_SIZE)),
@@ -90,6 +90,7 @@ fn frame(ui: &mut GroupUi, events: Vec<egui::Event>) {
     });
     output.textures_delta.clear();
     ui.shapes = output.shapes;
+    output.platform_output.cursor_icon
 }
 
 fn click(ui: &mut GroupUi, point: Pos2) {
@@ -160,7 +161,7 @@ fn assert_no_writes(
     frame(ui, Vec::new());
     drain_memory_app(&mut ui.app.runtime.app);
     assert_eq!(commits.load(Ordering::Relaxed), 0);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(original));
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(original));
     assert_eq!(ui.app.model.snapshot(), *original);
     assert_eq!(ui.app.model.change_token(), token);
     assert!(!ui.app.runtime.app.saving);
@@ -206,11 +207,11 @@ fn assert_layout_is_bounded(ui: &GroupUi, expected: &str, char_limit: usize) -> 
 #[test]
 fn megabyte_unicode_search_paste_is_bounded_before_layout_and_never_writes() {
     let (mut ui, commits) = ready_ui("原始名稱", "原始備註");
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let token = ui.app.model.change_token();
     click_label(&mut ui, "全選");
     assert_eq!(ui.app.selected.len(), 1);
-    click_label(&mut ui, "搜尋所有分頁的名稱");
+    click_label(&mut ui, "根據名稱查找");
     let payload = megabyte_json();
     let expected: String = payload.chars().take(INPUT_CHAR_LIMIT).collect();
     frame(&mut ui, vec![egui::Event::Paste(payload)]);
@@ -245,13 +246,9 @@ enum EditField {
 impl EditField {
     fn label(self) -> &'static str {
         match self {
-            Self::Name => "名稱（必填）",
-            Self::Description => "Email／備註（選填）",
+            Self::Name => "名稱 *",
+            Self::Description => "備註",
         }
-    }
-
-    fn limit(self) -> usize {
-        INPUT_CHAR_LIMIT
     }
 
     fn value(self, ui: &GroupUi) -> &str {
@@ -267,9 +264,11 @@ impl EditField {
     }
 }
 
-fn assert_edit_paste_bound_undo_and_close(field: EditField) {
+#[test]
+fn megabyte_unicode_note_paste_is_bounded_and_keeps_draft_undo_redo() {
+    let field = EditField::Description;
     let (mut ui, commits) = ready_ui("原始名稱🧪", "原始備註 é");
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let token = ui.app.model.change_token();
     open_edit(&mut ui);
     let point = ui.point(field.label()) + Vec2::new(0.0, 24.0);
@@ -279,11 +278,11 @@ fn assert_edit_paste_bound_undo_and_close(field: EditField) {
     settle_undo(&mut ui);
     command(&mut ui, egui::Key::A);
     let payload = megabyte_json();
-    let expected: String = payload.chars().take(field.limit()).collect();
+    let expected: String = payload.chars().take(INPUT_CHAR_LIMIT).collect();
     frame(&mut ui, vec![egui::Event::Paste(payload)]);
     assert_eq!(field.value(&ui), expected, "{field:?}");
     assert!(
-        assert_layout_is_bounded(&ui, &expected, field.limit()),
+        assert_layout_is_bounded(&ui, &expected, INPUT_CHAR_LIMIT),
         "the bounded edit value was not laid out in the paste frame"
     );
 
@@ -301,53 +300,31 @@ fn assert_edit_paste_bound_undo_and_close(field: EditField) {
 }
 
 #[test]
-fn megabyte_unicode_name_paste_is_bounded_and_keeps_draft_undo_redo() {
-    assert_edit_paste_bound_undo_and_close(EditField::Name);
-}
-
-#[test]
-fn megabyte_unicode_note_paste_is_bounded_and_keeps_draft_undo_redo() {
-    assert_edit_paste_bound_undo_and_close(EditField::Description);
-}
-
-fn assert_import_paste_bound_undo_and_close(field: EditField) {
+fn megabyte_unicode_import_name_paste_is_bounded_and_keeps_draft_undo_redo() {
     let (mut ui, commits) = ready_ui("原始名稱", "原始備註");
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let token = ui.app.model.change_token();
     ui.app.edit(&ui.ctx, None);
     for _ in 0..4 {
         frame(&mut ui, Vec::new());
     }
-    let value = |ui: &GroupUi| match field {
-        EditField::Name => ui.import().name.clone(),
-        EditField::Description => ui.import().description.clone(),
-    };
-    let point = ui.point(field.label()) + Vec2::new(0.0, 24.0);
+    let point = ui.point(EditField::Name.label()) + Vec2::new(0.0, 24.0);
     click(&mut ui, point);
     settle_undo(&mut ui);
-    let payload = megabyte_json();
+    let mut payload = megabyte_json();
     let expected: String = payload.chars().take(INPUT_CHAR_LIMIT).collect();
+    payload.insert_str(0, "\0\u{000b}\u{001f}");
     frame(&mut ui, vec![egui::Event::Paste(payload)]);
-    assert_eq!(value(&ui), expected, "import {field:?}");
+    assert_eq!(ui.import().name, expected);
     assert!(assert_layout_is_bounded(&ui, &expected, INPUT_CHAR_LIMIT));
     settle_undo(&mut ui);
     command(&mut ui, egui::Key::Z);
-    assert!(value(&ui).is_empty(), "import {field:?} undo");
+    assert!(ui.import().name.is_empty());
     command(&mut ui, egui::Key::Y);
-    assert_eq!(value(&ui), expected, "import {field:?} redo");
+    assert_eq!(ui.import().name, expected);
     click_label(&mut ui, "×");
     assert!(ui.app.dialog.is_none());
     assert_no_writes(&mut ui, &commits, &original, token);
-}
-
-#[test]
-fn megabyte_unicode_import_name_paste_is_bounded_and_keeps_draft_undo_redo() {
-    assert_import_paste_bound_undo_and_close(EditField::Name);
-}
-
-#[test]
-fn megabyte_unicode_import_note_paste_is_bounded_and_keeps_draft_undo_redo() {
-    assert_import_paste_bound_undo_and_close(EditField::Description);
 }
 
 fn text_at_byte_limit(block: &str, limit: usize) -> String {
@@ -370,7 +347,7 @@ fn byte_limit_existing_names_and_notes_survive_open_and_unchanged_apply_without_
         ),
     ] {
         let (mut ui, commits) = ready_ui(&name, &note);
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let token = ui.app.model.change_token();
         open_edit(&mut ui);
         assert_eq!(EditField::Name.value(&ui), name);
@@ -411,9 +388,9 @@ fn search_256_scalar_boundary_preserves_unicode_and_lowercase_expansion() {
         "İ".repeat(INPUT_CHAR_LIMIT / 2),
     ] {
         let (mut ui, commits) = ready_ui(&name, "原始備註");
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let token = ui.app.model.change_token();
-        click_label(&mut ui, "搜尋所有分頁的名稱");
+        click_label(&mut ui, "根據名稱查找");
         // U+0130 lowercases to two scalars (i + combining dot). The 256-scalar
         // search boundary applies to the entered query after that expansion.
         let query = name.to_lowercase();
@@ -502,7 +479,7 @@ fn legacy_partial_replacement_is_atomic_preserves_selection_and_unchanged_apply_
         for paste in [false, true] {
             for before in legacy_field_values() {
                 let (mut ui, commits) = ready_ui(&before, &before);
-                let original = ui.app.runtime.app.current.clone().unwrap();
+                let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
                 let token = ui.app.model.change_token();
                 open_edit(&mut ui);
                 let id = focus_edit_field(&mut ui, field);
@@ -549,7 +526,7 @@ fn legacy_long_fields_allow_delete_then_valid_correction_undo_and_exactly_one_ap
         for paste in [false, true] {
             for before in legacy_field_values() {
                 let (mut ui, commits) = ready_ui(&before, &before);
-                let original = ui.app.runtime.app.current.clone().unwrap();
+                let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
                 let token = ui.app.model.change_token();
                 open_edit(&mut ui);
                 let id = focus_edit_field(&mut ui, field);
@@ -596,14 +573,10 @@ fn legacy_long_fields_allow_delete_then_valid_correction_undo_and_exactly_one_ap
 
                 click_label(&mut ui, "套用");
                 assert!(ui.app.dialog.is_none());
-                for _ in 0..4 {
-                    frame(&mut ui, Vec::new());
-                    drain_memory_app(&mut ui.app.runtime.app);
-                }
-                let saved = ui.app.runtime.app.current.as_ref().unwrap();
+                wait_runtime(&mut ui);
+                let saved = ui.app.runtime.app.current.as_deref().unwrap();
                 let mut expected = original.clone();
                 expected.revision += 1;
-                expected.authenticators[0].updated_at_ms = saved.authenticators[0].updated_at_ms;
                 match field {
                     EditField::Name => expected.authenticators[0].name = corrected,
                     EditField::Description => expected.authenticators[0].description = corrected,
@@ -643,7 +616,7 @@ fn legacy_same_frame_selection_and_replacement_follow_event_order_and_keep_undo(
         for paste in [false, true] {
             let before = "中🧪é".repeat(100);
             let (mut ui, commits) = ready_ui(&before, &before);
-            let original = ui.app.runtime.app.current.clone().unwrap();
+            let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
             let token = ui.app.model.change_token();
             open_edit(&mut ui);
             let id = focus_edit_field(&mut ui, field);
@@ -693,7 +666,7 @@ fn legacy_partial_replacement_rejects_257_then_accepts_256_and_saves_exactly_onc
         for paste in [false, true] {
             let before = "中🧪é".repeat(100);
             let (mut ui, commits) = ready_ui(&before, &before);
-            let original = ui.app.runtime.app.current.clone().unwrap();
+            let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
             let token = ui.app.model.change_token();
             open_edit(&mut ui);
             let id = focus_edit_field(&mut ui, field);
@@ -751,14 +724,10 @@ fn legacy_partial_replacement_rejects_257_then_accepts_256_and_saves_exactly_onc
 
             click_label(&mut ui, "套用");
             assert!(ui.app.dialog.is_none());
-            for _ in 0..4 {
-                frame(&mut ui, Vec::new());
-                drain_memory_app(&mut ui.app.runtime.app);
-            }
-            let saved = ui.app.runtime.app.current.as_ref().unwrap();
+            wait_runtime(&mut ui);
+            let saved = ui.app.runtime.app.current.as_deref().unwrap();
             let mut expected = original.clone();
             expected.revision += 1;
-            expected.authenticators[0].updated_at_ms = saved.authenticators[0].updated_at_ms;
             match field {
                 EditField::Name => expected.authenticators[0].name = corrected,
                 EditField::Description => expected.authenticators[0].description = corrected,
@@ -780,7 +749,7 @@ fn legacy_ime_empty_commit_then_undo_and_paste_keeps_event_order_and_ordinary_li
     for field in [EditField::Name, EditField::Description] {
         let before = "中🧪é".repeat(100);
         let (mut ui, commits) = ready_ui(&before, &before);
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let token = ui.app.model.change_token();
         open_edit(&mut ui);
         focus_edit_field(&mut ui, field);

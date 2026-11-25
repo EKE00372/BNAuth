@@ -7,28 +7,43 @@ enum Target {
 }
 
 fn drag_ui() -> (GroupUi, Arc<AtomicUsize>) {
+    drag_ui_with_full_group(false)
+}
+
+fn drag_ui_with_full_group(fill_other: bool) -> (GroupUi, Arc<AtomicUsize>) {
     let mut ui = GroupUi::new();
-    let mut vault = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
-    vault.groups.push(bnauth_core::Group {
-        id: uuid::Uuid::new_v4(),
-        name: "Drag Target".into(),
-        sort_order: 1,
-        is_ungrouped: false,
-    });
-    for (name, secret) in [
-        ("Drag First", "1".repeat(40)),
-        ("Drag Second", "2".repeat(40)),
+    let mut vault = bnauth_core::VaultSnapshot::new_empty();
+    for (sort_order, name) in [(1, "Drag Target"), (2, "Other")] {
+        vault.groups.push(bnauth_core::Group {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            sort_order,
+            is_ungrouped: false,
+        });
+    }
+    for (group, name, secret) in [
+        (0, "Drag First", "1".repeat(40)),
+        (2, "Other record", "3".repeat(40)),
+        (0, "Drag Second", "2".repeat(40)),
     ] {
         vault = bnauth_core::prepare_import(
             &vault,
             name,
             "Complete note 🧪",
-            vault.ungrouped_id().unwrap(),
+            vault.groups[group].id,
             bnauth_core::parse_manual(&secret, "", "").unwrap(),
-            IMPORT_TEST_TIME,
         )
         .unwrap()
-        .candidate;
+        .candidate(&vault)
+        .unwrap();
+    }
+    if fill_other {
+        for order in 1..crate::model::MAX_GROUP_ENTRIES {
+            let mut record = vault.authenticators[1].clone();
+            record.id = uuid::Uuid::new_v4();
+            record.sort_order = order as u32;
+            vault.authenticators.push(record);
+        }
     }
     vault.validate().unwrap();
     ui.use_memory_vault(vault.clone());
@@ -95,30 +110,35 @@ fn assert_saved_once(
     for _ in 0..4 {
         frame(ui, Vec::new());
     }
-    let saved = ui.app.runtime.app.current.as_ref().unwrap();
+    let saved = ui.app.runtime.app.current.as_deref().unwrap();
     let mut expected = before.clone();
     expected.revision += 1;
-    expected.authenticators.swap(0, 1);
-    let destination = match target {
-        Target::Reorder => before.groups[0].id,
-        Target::Group => before.groups[1].id,
+    expected.authenticators[2].sort_order = 0;
+    let source_names: &[&str] = match target {
+        Target::Reorder => {
+            expected.authenticators[0].sort_order = 1;
+            &["Drag Second", "Drag First"]
+        }
+        Target::Group => {
+            expected.authenticators[0].group_id = before.groups[1].id;
+            &["Drag Second"]
+        }
     };
-    expected.authenticators[0].sort_order = 0;
-    expected.authenticators[1].group_id = destination;
-    expected.authenticators[1].sort_order = match target {
-        Target::Reorder => 1,
-        Target::Group => 0,
-    };
-    for record in &mut expected.authenticators {
-        record.updated_at_ms = saved
-            .authenticators
-            .iter()
-            .find(|saved| saved.id == record.id)
-            .unwrap()
-            .updated_at_ms;
-    }
     assert_eq!(saved, &expected, "{target:?}: wrong persisted snapshot");
-    assert_eq!(ui.app.model.snapshot(), expected);
+    assert!(std::ptr::eq(&*saved.groups, &*before.groups));
+    assert!(std::ptr::eq(
+        &*saved.authenticators[1],
+        &*before.authenticators[1],
+    ));
+    let reopened = crate::model::VaultModel::from_snapshot(saved);
+    for model in [&ui.app.model, &reopened] {
+        let names: Vec<_> = model
+            .filtered(model.groups[0].id, "", false)
+            .iter()
+            .map(|id| model.entry(*id).unwrap().record.name.as_str())
+            .collect();
+        assert_eq!(names, source_names);
+    }
     assert_eq!(commits.load(Ordering::Relaxed), 1, "{target:?}");
     assert!(!ui.app.runtime.app.has_pending());
     assert!(!ui.app.runtime.app.saving);
@@ -130,7 +150,7 @@ fn assert_saved_once(
 fn secondary_drag_never_reorders_moves_or_saves() {
     for target in [Target::Reorder, Target::Group] {
         let (mut ui, commits) = drag_ui();
-        let before = ui.app.runtime.app.current.clone().unwrap();
+        let before = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let token = ui.app.model.change_token();
         begin_drag(
             &mut ui,
@@ -158,11 +178,11 @@ fn secondary_drag_never_reorders_moves_or_saves() {
 fn primary_held_on_blank_does_not_authorize_secondary_drag_and_next_primary_drag_saves_once() {
     for target in [Target::Reorder, Target::Group] {
         let (mut ui, commits) = drag_ui();
-        let before = ui.app.runtime.app.current.clone().unwrap();
+        let before = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let token = ui.app.model.change_token();
         // Start on the unused footer gap, outside row, scrollbar and resize
         // hit regions. The primary press therefore owns no data row.
-        let footer = ui.point("總共 2 個，本組 2 個");
+        let footer = ui.point("總共 3 個，本組 2 個");
         let blank = Pos2::new(250.0, footer.y);
         frame(&mut ui, vec![egui::Event::PointerMoved(blank)]);
         frame(
@@ -217,14 +237,14 @@ fn primary_held_on_blank_does_not_authorize_secondary_drag_and_next_primary_drag
 fn secondary_release_during_primary_drag_waits_for_primary_and_saves_once() {
     for target in [Target::Reorder, Target::Group] {
         let (mut ui, commits) = drag_ui();
-        let before = ui.app.runtime.app.current.clone().unwrap();
+        let before = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let token = ui.app.model.change_token();
         let first = ui.app.model.entries[0].id;
         begin_drag(&mut ui, egui::PointerButton::Primary, egui::Modifiers::NONE);
         // Tap the secondary button over a row, then continue the left drag.
         // A tab's deliberate right-click context menu is a separate interaction.
         let point = over_target(&mut ui, Target::Reorder);
-        assert_eq!(ui.app.dragging, Some(first));
+        assert_eq!(ui.app.dragged_entry().map(|entry| entry.id), Some(first));
         for pressed in [true, false] {
             frame(
                 &mut ui,
@@ -240,7 +260,11 @@ fn secondary_release_during_primary_drag_waits_for_primary_and_saves_once() {
             ui.ctx
                 .input(|input| input.pointer.button_down(egui::PointerButton::Primary))
         );
-        assert_eq!(ui.app.dragging, Some(first), "{target:?}: premature drop");
+        assert_eq!(
+            ui.app.dragged_entry().map(|entry| entry.id),
+            Some(first),
+            "{target:?}: premature drop"
+        );
         assert_no_writes(&mut ui, &commits, &before, token);
         let point = over_target(&mut ui, target);
         frame(
@@ -259,8 +283,26 @@ fn secondary_release_during_primary_drag_waits_for_primary_and_saves_once() {
 #[test]
 fn primary_drag_reorder_and_group_drop_save_once() {
     for target in [Target::Reorder, Target::Group] {
-        let (mut ui, commits) = drag_ui();
-        let before = ui.app.runtime.app.current.clone().unwrap();
+        let (mut ui, commits) = drag_ui_with_full_group(matches!(target, Target::Group));
+        let before = ui.app.runtime.app.current.as_deref().unwrap().clone();
+        if matches!(target, Target::Group) {
+            let token = ui.app.model.change_token();
+            begin_drag(&mut ui, egui::PointerButton::Primary, egui::Modifiers::NONE);
+            let full = ui.point("Other");
+            let cursor = frame(&mut ui, vec![egui::Event::PointerMoved(full)]);
+            assert_eq!(cursor, egui::CursorIcon::NoDrop);
+            assert!(ui.app.drop.is_none());
+            frame(
+                &mut ui,
+                vec![pointer_button(
+                    full,
+                    egui::PointerButton::Primary,
+                    false,
+                    egui::Modifiers::NONE,
+                )],
+            );
+            assert_no_writes(&mut ui, &commits, &before, token);
+        }
         begin_drag(&mut ui, egui::PointerButton::Primary, egui::Modifiers::NONE);
         let point = over_target(&mut ui, target);
         frame(
@@ -279,10 +321,12 @@ fn primary_drag_reorder_and_group_drop_save_once() {
 #[test]
 fn ctrl_click_toggles_selection_and_ctrl_drag_never_saves() {
     let (mut ui, commits) = drag_ui();
-    let before = ui.app.runtime.app.current.clone().unwrap();
+    let before = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let token = ui.app.model.change_token();
-    let first = ui.app.model.entries[0].id;
-    let second = ui.app.model.entries[1].id;
+    let rows = ui.app.model.filtered(ui.app.group, "", false);
+    let [first, second] = rows[..] else {
+        panic!("expected both drag rows in the source group");
+    };
     let ctrl = egui::Modifiers {
         ctrl: true,
         command: true,
@@ -306,7 +350,7 @@ fn ctrl_click_toggles_selection_and_ctrl_drag_never_saves() {
                 ],
             );
         }
-        assert_eq!(ui.app.selected, selected);
+        assert_eq!(*ui.app.selected, selected);
     }
     begin_drag(&mut ui, egui::PointerButton::Primary, ctrl);
     let point = over_target(&mut ui, Target::Reorder);
@@ -324,7 +368,7 @@ fn ctrl_click_toggles_selection_and_ctrl_drag_never_saves() {
         &mut ui,
         vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
     );
-    assert_eq!(ui.app.selected, BTreeSet::from([first, second]));
+    assert_eq!(*ui.app.selected, BTreeSet::from([first, second]));
     assert!(ui.app.drag_origin.is_none());
     assert_no_writes(&mut ui, &commits, &before, token);
 }
@@ -333,7 +377,7 @@ fn ctrl_click_toggles_selection_and_ctrl_drag_never_saves() {
 fn escape_cancels_primary_drag_and_release_never_saves() {
     for target in [Target::Reorder, Target::Group] {
         let (mut ui, commits) = drag_ui();
-        let before = ui.app.runtime.app.current.clone().unwrap();
+        let before = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let token = ui.app.model.change_token();
         begin_drag(&mut ui, egui::PointerButton::Primary, egui::Modifiers::NONE);
         let point = over_target(&mut ui, target);

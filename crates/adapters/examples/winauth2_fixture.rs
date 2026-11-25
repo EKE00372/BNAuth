@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("Supply an output directory")?,
     );
     fs::create_dir_all(&directory)?;
-    let empty = VaultSnapshot::new_empty(1_800_000_000_000);
+    let empty = VaultSnapshot::new_empty();
     let mut vault = prepare_import(
         &empty,
         " 繁體 & <title> \"' 😀 ",
@@ -25,9 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "US-1234-5678-9012",
             "AbCd123456",
         )?,
-        1_800_000_000_000,
     )?
-    .candidate;
+    .candidate(&empty)?;
     let record = &mut vault.authenticators[0];
     for (name, offset) in [
         ("with-serial", Some(-1234)),
@@ -47,7 +46,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let record = &mut vault.authenticators[0];
     record.serial = None;
     record.restore_code = None;
-    record.restore_code_source = None;
     for (name, offset) in [
         ("seed-only", None),
         ("seed-only-zero", Some(0)),

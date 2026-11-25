@@ -1,5 +1,4 @@
 use super::*;
-use std::collections::HashMap;
 
 #[derive(PartialEq)]
 struct LayoutKey {
@@ -48,17 +47,17 @@ impl DeleteConfirmation {
                 .data_mut(|data| data.remove::<egui::scroll_area::State>(id));
         }
         if self.token != Some(model.change_token()) {
-            let entries: HashMap<_, _> = model.entries.iter().map(|e| (e.id, e)).collect();
-            let groups: HashMap<_, _> = model
-                .groups
-                .iter()
-                .map(|g| (g.id, g.name.as_str()))
-                .collect();
+            let mut group_names = std::collections::HashMap::new();
             self.labels = self
                 .ids
                 .iter()
-                .filter_map(|id| entries.get(id))
-                .map(|e| format!("{} · {}", e.name, groups[&e.group_id]))
+                .filter_map(|&id| model.entry(id))
+                .map(|entry| {
+                    let group = group_names
+                        .entry(entry.group_id)
+                        .or_insert_with(|| model.group_name(entry.group_id).unwrap_or_default());
+                    format!("{} · {group}", entry.record.name)
+                })
                 .collect();
             self.token = Some(model.change_token());
             self.layout = None;

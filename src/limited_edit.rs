@@ -14,37 +14,103 @@ fn composition_id(id: Id) -> Id {
 }
 
 pub(super) fn reset(ctx: &egui::Context, id: Id) {
-    ctx.data_mut(|data| data.remove::<bool>(composition_id(id)));
+    ctx.data_mut(|data| {
+        data.remove::<bool>(composition_id(id));
+        data.remove::<bool>(id.with("legacy_long_draft"));
+    });
 }
 
-pub(super) fn show(
+pub(super) fn name_and_note(
     ui: &mut egui::Ui,
-    text: &mut String,
+    (name, name_id): (&mut String, Id),
+    (note, note_id): (&mut String, Id),
+    name_hint: Option<&str>,
+) -> (egui::Response, egui::Response) {
+    ui.label("名稱 *");
+    let name_response = show(ui, name, name_id, name_hint);
+    ui.label("備註");
+    let note_response = show(ui, note, note_id, None);
+    (name_response, note_response)
+}
+
+#[must_use]
+pub(super) struct FieldPaste(Option<(egui::Context, Vec<(usize, String)>)>);
+
+impl Drop for FieldPaste {
+    fn drop(&mut self) {
+        if let Some((ctx, originals)) = self.0.take() {
+            ctx.input_mut(|input| {
+                for (index, text) in originals {
+                    input.events[index] = Event::Paste(text);
+                }
+            });
+        }
+    }
+}
+
+pub(super) fn prepare_paste(
+    ui: &egui::Ui,
     id: Id,
-    hint: Option<&str>,
-) -> egui::text_edit::TextEditOutput {
+    limit: usize,
+    keep: impl Fn(char) -> bool,
+) -> FieldPaste {
+    let mut originals = Vec::new();
+    if ui.memory(|memory| memory.has_focus(id)) {
+        // The focused editor sees a bounded paste. Another field receiving focus
+        // later in the same frame can still process the original clipboard text.
+        ui.input_mut(|input| {
+            for (index, event) in input.events.iter_mut().enumerate() {
+                if let Event::Paste(pasted) = event {
+                    if pasted.len() <= limit && pasted.chars().all(&keep) {
+                        continue;
+                    }
+                    let accepted: String =
+                        pasted.chars().filter(|ch| keep(*ch)).take(limit).collect();
+                    if accepted.len() != pasted.len() {
+                        originals.push((index, std::mem::replace(pasted, accepted)));
+                    }
+                }
+            }
+        });
+    }
+    FieldPaste((!originals.is_empty()).then(|| (ui.ctx().clone(), originals)))
+}
+
+fn show(ui: &mut egui::Ui, text: &mut String, id: Id, hint: Option<&str>) -> egui::Response {
     let focused = ui.memory(|memory| memory.has_focus(id));
-    let owns_ime = ui.memory(|memory| memory.owns_ime_events(id));
+    // The extra character distinguishes an oversized replacement of legacy text from an exact fit.
+    let _paste = prepare_paste(ui, id, LIMIT + 1, |ch| ch > '\u{001f}');
+    // Only a draft that once exceeded the current limit can restore an oversized
+    // value with Undo. Ordinary typing and IME go directly to the real widget.
+    let history_id = id.with("legacy_long_draft");
+    // The draft and its Undo history are reset together when opening a form.
+    let legacy = ui.ctx().data_mut(|data| {
+        *data.get_temp_mut_or_insert_with(history_id, || {
+            text.len() > LIMIT && text.chars().nth(LIMIT).is_some()
+        })
+    });
+    let owns_ime = legacy && ui.memory(|memory| memory.owns_ime_events(id));
     let mut composing = owns_ime
-        && egui::text_edit::TextEditState::load(ui.ctx(), id).is_some()
         && ui
             .ctx()
             .data(|data| data.get_temp::<bool>(composition_id(id)).unwrap_or(false));
-    let needs_guard = ui.input(|input| {
-        (input.events.iter().any(|event| {
-            if focused {
-                replacement(event, id).is_some()
-            } else {
-                action_value(event, id, egui::accesskit::Action::SetValue).is_some()
-            }
-        }) && (text.chars().count() > LIMIT || (focused && input.events.iter().any(is_undo_redo))))
-            || (owns_ime
-                && ((composing && !input.events.is_empty())
-                    || input
-                        .events
-                        .iter()
-                        .any(|event| matches!(event, Event::Ime(_)))))
-    });
+    let needs_guard = legacy
+        && ui.input(|input| {
+            (input.events.iter().any(|event| {
+                if focused {
+                    replacement(event, id).is_some()
+                } else {
+                    action_value(event, id, egui::accesskit::Action::SetValue).is_some()
+                }
+            }) && ((text.len() > LIMIT && text.chars().nth(LIMIT).is_some())
+                || (focused && input.events.iter().any(is_undo_redo))))
+                || (owns_ime
+                    && ((composing && !input.events.is_empty())
+                        || input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, Event::Ime(_)))))
+        });
     let mut hidden = Vec::new();
     if needs_guard {
         let mut events = ui.input_mut(|input| std::mem::take(&mut input.events));
@@ -69,7 +135,8 @@ pub(super) fn show(
     let output = edit.show(ui);
     // Pointer interaction follows keyboard/IME handling inside TextEdit.
     let shift = ui.input(|input| input.modifiers.shift);
-    if output.response.interact_pointer_pos().is_some()
+    if legacy
+        && output.response.interact_pointer_pos().is_some()
         && (output.response.clicked()
             || (!shift && (output.response.double_clicked() || output.response.triple_clicked()))
             || (output.response.sense.senses_drag()
@@ -78,8 +145,10 @@ pub(super) fn show(
     {
         composing = false;
     }
-    ui.ctx()
-        .data_mut(|data| data.insert_temp(composition_id(id), composing));
+    if legacy {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(composition_id(id), composing));
+    }
     if !hidden.is_empty() {
         ui.input_mut(|input| {
             for (index, event) in hidden {
@@ -87,7 +156,7 @@ pub(super) fn show(
             }
         });
     }
-    output
+    output.response.response
 }
 
 fn action_value(event: &Event, id: Id, action: egui::accesskit::Action) -> Option<&str> {

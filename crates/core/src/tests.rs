@@ -1,16 +1,16 @@
 use super::*;
 
-const T: i64 = 1_700_000_000_000;
 const RFC_SEED: &str = "3132333435363738393031323334353637383930";
 
 fn material() -> ManualMaterial {
     parse_manual(RFC_SEED, "", "").unwrap()
 }
 fn one_entry() -> VaultSnapshot {
-    let vault = VaultSnapshot::new_empty(T);
-    prepare_import(&vault, "旅行者", "", vault.groups[0].id, material(), T)
+    let vault = VaultSnapshot::new_empty();
+    prepare_import(&vault, "旅行者", "", vault.groups[0].id, material())
         .unwrap()
-        .candidate
+        .candidate(&vault)
+        .unwrap()
 }
 fn packed74() -> String {
     let suffix: String = b"US-1234-5678-9012"
@@ -94,8 +94,6 @@ fn manual40_and74_preserve_actual_supplied_fields() {
     assert_eq!(display_serial("US123456789012"), "US-1234-5678-9012");
     assert_eq!(forty.restore_code.as_deref(), Some("AbCd123456"));
     assert!(seventy_four.restore_code.is_none());
-    assert_eq!(forty.source, "manual-40");
-    assert_eq!(seventy_four.source, "manual-74");
     assert!(parse_manual(&packed74(), "EU123456789012", "").is_err());
     assert!(parse_manual(&packed74(), "us123456789012", "").is_ok());
 }
@@ -159,9 +157,11 @@ fn invalid_manual_formats_are_rejected_without_prefix_fallback() {
 }
 
 #[test]
-fn duplicate_seed_keeps_name_group_id_and_existing_values() {
+fn manual_import_reports_matching_groups_and_appends_independent_records() {
     let mut vault = one_entry();
     vault.revision = 7;
+    vault.authenticators[0].serial = Some("US123456789012".into());
+    vault.authenticators[0].restore_code = Some("OtherGroup".into());
     let another = Uuid::new_v4();
     vault.groups.push(Group {
         id: another,
@@ -170,73 +170,72 @@ fn duplicate_seed_keeps_name_group_id_and_existing_values() {
         is_ungrouped: false,
     });
     let original = vault.clone();
-    let preview = prepare_import(&vault, "改名來源", "", another, material(), T + 99).unwrap();
-    assert!(!preview.changed);
-    assert!(!preview.new_secret);
-    assert_eq!(preview.existing_id, Some(vault.authenticators[0].id));
-    assert_eq!(preview.candidate, original);
-    assert_eq!(vault, original);
+    let added = prepare_import(
+        &vault,
+        "另一分組的名稱",
+        "",
+        another,
+        parse_manual(&packed74(), "", "").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        added.preview.matches,
+        vec![(
+            vault.groups[0].name.clone(),
+            vault.authenticators[0].name.clone(),
+        )]
+    );
+    let prior = added.candidate(&vault).unwrap();
+    let [foreign, local] = prior.authenticators.as_slice() else {
+        panic!("expected separate records in both groups");
+    };
+    assert_eq!(foreign, &vault.authenticators[0]);
+    assert_ne!(local.id, foreign.id);
+    assert_eq!(local.group_id, another);
+    assert_eq!(local.secret, foreign.secret);
 
-    let supplement = parse_manual(&packed74(), "", "AbCd123456").unwrap();
-    let preview =
-        prepare_import(&vault, "改名來源", "補充備註", another, supplement, T + 100).unwrap();
-    let entry = &preview.candidate.authenticators[0];
-    assert!(preview.changed);
-    assert!(!preview.new_secret);
-    assert_eq!(entry.id, original.authenticators[0].id);
-    assert_eq!(entry.group_id, original.groups[0].id);
-    assert_eq!(entry.name, "旅行者");
-    assert_eq!(entry.description, "補充備註");
-    assert_eq!(entry.serial.as_deref(), Some("US123456789012"));
+    let duplicate = parse_manual(RFC_SEED, "EU123456789012", "AbCd123456").unwrap();
+    let preview = prepare_import(&prior, "獨立名稱", "獨立備註", another, duplicate).unwrap();
+    let candidate = preview.candidate(&prior).unwrap();
+    let entry = &candidate.authenticators[2];
+    assert_eq!(
+        preview.preview.matches,
+        vec![
+            (vault.groups[0].name.clone(), foreign.name.clone()),
+            ("其他".into(), local.name.clone()),
+        ]
+    );
+    assert_ne!(entry.id, local.id);
+    assert_eq!(entry.group_id, another);
+    assert_eq!(entry.sort_order, 1);
+    assert_eq!(entry.name, "獨立名稱");
+    assert_eq!(entry.description, "獨立備註");
+    assert_eq!(entry.serial.as_deref(), Some("EU123456789012"));
     assert_eq!(entry.restore_code.as_deref(), Some("AbCd123456"));
-    assert_eq!(entry.restore_code_source.as_deref(), Some("manual"));
-    assert_eq!(preview.candidate.revision, 7);
+    assert_eq!(
+        &candidate.authenticators[..2],
+        prior.authenticators.as_slice()
+    );
+    assert_eq!(candidate.revision, 7);
     assert_eq!(vault, original, "Preview must not mutate live data");
 }
 
 #[test]
-fn conflicts_reject_and_same_serial_different_seed_is_a_separate_candidate() {
+fn same_serial_with_a_different_key_is_not_a_duplicate_match() {
     let mut vault = one_entry();
     vault.authenticators[0].serial = Some("US123456789012".into());
     vault.authenticators[0].restore_code = Some("AbCd123456".into());
-    vault.authenticators[0].restore_code_source = Some("manual".into());
     let original = vault.clone();
     let group = vault.groups[0].id;
-    assert!(
-        prepare_import(
-            &vault,
-            "x",
-            "",
-            group,
-            parse_manual(RFC_SEED, "EU123456789012", "").unwrap(),
-            T
-        )
-        .is_err()
-    );
-    assert!(
-        prepare_import(
-            &vault,
-            "x",
-            "",
-            group,
-            parse_manual(RFC_SEED, "", "different").unwrap(),
-            T
-        )
-        .is_err()
-    );
-    assert_eq!(vault, original);
     let other = parse_manual(&"ab".repeat(20), "US123456789012", "").unwrap();
-    let preview = prepare_import(&vault, "旅行者", "", group, other, T + 1).unwrap();
-    assert!(preview.new_secret);
-    assert!(preview.summary.contains("相同序號"));
-    assert_eq!(preview.candidate.authenticators.len(), 2);
-    assert_eq!(
-        preview.candidate.authenticators[0],
-        original.authenticators[0]
-    );
+    let preview = prepare_import(&vault, "旅行者", "", group, other).unwrap();
+    assert!(preview.preview.matches.is_empty());
+    let candidate = preview.candidate(&vault).unwrap();
+    assert_eq!(candidate.authenticators.len(), 2);
+    assert_eq!(candidate.authenticators[0], original.authenticators[0]);
     assert_ne!(
-        preview.candidate.authenticators[0].id,
-        preview.candidate.authenticators[1].id
+        candidate.authenticators[0].id,
+        candidate.authenticators[1].id
     );
 }
 
@@ -250,13 +249,9 @@ fn snapshot_roundtrip_preserves_unicode_nulls_whitespace_and_redacts_seed() {
     decoded.validate().unwrap();
     assert_eq!(decoded, vault);
     assert!(!format!("{vault:?}").contains(RFC_SEED));
-    let mut no_seed = vault.clone();
-    no_seed.authenticators[0].secret = None;
-    no_seed.validate().unwrap();
-    assert_eq!(
-        serde_json::from_slice::<VaultSnapshot>(&serde_json::to_vec(&no_seed).unwrap()).unwrap(),
-        no_seed
-    );
+    let record = &decoded.authenticators[0];
+    assert_eq!(record.secret.hex(), RFC_SEED);
+    assert!(record.serial.is_none() && record.restore_code.is_none());
 }
 
 #[test]
@@ -319,14 +314,7 @@ fn snapshot_rejects_relationship_corruption_and_unsupported_parameters() {
     changed.schema_version = 2;
     assert!(changed.validate().is_err());
     let mut changed = base.clone();
-    changed
-        .authenticators
-        .push(changed.authenticators[0].clone());
-    assert!(changed.validate().is_err());
-    let mut changed = base.clone();
-    let mut duplicate = changed.authenticators[0].clone();
-    duplicate.id = Uuid::new_v4();
-    duplicate.sort_order = 1;
+    let duplicate = changed.authenticators[0].clone();
     changed.authenticators.push(duplicate);
     assert!(changed.validate().is_err());
 }
@@ -359,7 +347,7 @@ fn exact_text_byte_limits_and_above_limit_are_enforced() {
 
 #[test]
 fn exact_group_entry_and_global_limits_are_enforced() {
-    let mut vault = VaultSnapshot::new_empty(T);
+    let mut vault = VaultSnapshot::new_empty();
     for index in 1..MAX_GROUPS {
         vault.groups.push(Group {
             id: Uuid::new_v4(),
@@ -384,20 +372,11 @@ fn exact_group_entry_and_global_limits_are_enforced() {
             entry.id = Uuid::new_v4();
             entry.group_id = vault.groups[group_index].id;
             entry.sort_order = index as u32;
-            let mut bytes = [0_u8; 20];
-            bytes[..8].copy_from_slice(&(vault.authenticators.len() as u64).to_be_bytes());
-            entry.secret = Some(Secret::from_bytes(bytes));
             vault.authenticators.push(entry);
         }
     }
     vault.validate().unwrap();
-    assert!(prepare_import(&vault, "超出", "", vault.groups[10].id, material(), T).is_err());
-    // Duplicate seeds must still be rejected across groups at the 1000-row limit.
-    let last_secret = vault.authenticators.last().unwrap().secret.clone();
-    vault.authenticators.last_mut().unwrap().secret = vault.authenticators[0].secret.clone();
-    assert!(vault.validate().unwrap_err().contains("相同的長密鑰"));
-    vault.authenticators.last_mut().unwrap().secret = last_secret;
-    vault.validate().unwrap();
+    assert!(prepare_import(&vault, "超出", "", vault.groups[10].id, material()).is_err());
     let mut extra = prototype;
     extra.id = Uuid::new_v4();
     extra.group_id = vault.groups[10].id;
@@ -411,39 +390,20 @@ fn exact_group_entry_and_global_limits_are_enforced() {
 }
 
 #[test]
-fn provenance_limit_matches_the_native_array_reader_limit() {
-    let mut vault = one_entry();
-    let source = Provenance {
-        source_vault_id: Uuid::new_v4(),
-        source_revision: 1,
-        scope: "full".into(),
-        imported_at_ms: T,
-        source_time_sync: None,
-    };
-    vault.provenance = vec![source.clone(); 1000];
-    vault.validate().unwrap();
-    let json = serde_json::to_vec(&vault).unwrap();
-    let decoded: VaultSnapshot = serde_json::from_slice(&json).unwrap();
-    assert_eq!(decoded, vault);
-    decoded.validate().unwrap();
-    vault.provenance.push(source);
-    assert!(vault.validate().is_err());
-}
-
-#[test]
 fn group_name_uniqueness_matches_gui_case_and_whitespace_rules() {
-    let mut vault = VaultSnapshot::new_empty(T);
+    let mut vault = VaultSnapshot::new_empty();
     for name in [" Main ", "mAiN"] {
+        let sort_order = vault.groups.len() as u32;
         vault.groups.push(Group {
             id: Uuid::new_v4(),
             name: name.into(),
-            sort_order: vault.groups.len() as u32,
+            sort_order,
             is_ungrouped: false,
         });
     }
-    assert!(vault.validate().is_err());
-    vault.groups[2].name = "Other".into();
     vault.validate().unwrap();
+    vault.groups[2].name = " mAiN ".into();
+    assert!(vault.validate().is_err());
     vault.groups[1].name = "ПРИВЕТ".into();
     vault.groups[2].name = "привет".into();
     assert!(vault.validate().is_err());

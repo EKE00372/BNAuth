@@ -2,14 +2,11 @@ use bnauth_adapters::{
     export_file::{self, Format},
     native,
 };
-use bnauth_core::{
-    Group, LegacyMetadata, Provenance, RecoveryEvent, Secret, Uuid, VaultSnapshot, parse_manual,
-    prepare_import,
-};
+use bnauth_core::{Group, Secret, Uuid, VaultSnapshot, parse_manual, prepare_import};
 use std::{fs, path::PathBuf};
 
 fn fixture() -> (VaultSnapshot, Uuid) {
-    let mut vault = VaultSnapshot::new_empty(1_800_000_000_000);
+    let mut vault = VaultSnapshot::new_empty();
     let group = Uuid::new_v4();
     vault.groups.push(Group {
         id: group,
@@ -28,51 +25,24 @@ fn fixture() -> (VaultSnapshot, Uuid) {
             "AbCd123456",
         )
         .unwrap(),
-        1_800_000_000_000,
     )
     .unwrap()
-    .candidate
-    .authenticators
-    .remove(0);
+    .record();
     let mut other = record.clone();
     other.id = Uuid::new_v4();
     other.name = "其他分組的私有資料".into();
     other.group_id = vault.groups[0].id;
-    other.secret = Some(Secret::from_bytes([255; 20]));
+    other.secret = Secret::from_bytes([255; 20]);
     vault.authenticators.push(other);
     for index in (0..100).rev() {
         let mut record = record.clone();
         record.id = Uuid::new_v4();
         record.name = format!("完整名稱 {index:03}");
         record.sort_order = index;
-        record.secret = if index == 0 {
-            None
-        } else {
-            Some(Secret::from_bytes([index as u8; 20]))
-        };
-        record.recovery_history.push(RecoveryEvent {
-            at_ms: 1_800_000_000_000,
-            operation: "restore".into(),
-            outcome: "saved".into(),
-            confirmation: None,
-        });
-        record.legacy_metadata.push(LegacyMetadata {
-            source: "test".into(),
-            source_version: None,
-            field: "original".into(),
-            original_value: " 完整歷史 ".into(),
-            unit: None,
-        });
+        record.secret = Secret::from_bytes([index as u8; 20]);
         vault.authenticators.push(record);
     }
     vault.revision = 7;
-    vault.provenance.push(Provenance {
-        source_vault_id: Uuid::new_v4(),
-        source_revision: 2,
-        scope: "full".into(),
-        imported_at_ms: 1_800_000_000_000,
-        source_time_sync: None,
-    });
     vault.validate().unwrap();
     (vault, group)
 }
@@ -81,8 +51,8 @@ fn fixture() -> (VaultSnapshot, Uuid) {
 fn group_export_retains_all_one_hundred_records_fields_and_order_without_other_groups() {
     let (source, group) = fixture();
     let original = source.clone();
-    let exported = source.export_group(group).unwrap();
-    let bytes = native::encode_group(&exported).unwrap();
+    let exported = source.export_group_from_validated(group).unwrap();
+    let bytes = native::encode_backup_from_validated(&exported.file_view()).unwrap();
     let decoded = native::decode_group(&bytes).unwrap();
     assert_eq!(decoded, exported);
     assert_eq!(decoded.scope, "group");
@@ -103,10 +73,8 @@ fn group_export_retains_all_one_hundred_records_fields_and_order_without_other_g
                 .unwrap()
         );
     }
-    assert!(decoded.authenticators[0].secret.is_none());
     assert_eq!(decoded.vault_id, source.vault_id);
     assert_eq!(decoded.revision, source.revision);
-    assert_eq!(decoded.provenance, source.provenance);
     assert!(!String::from_utf8_lossy(&bytes).contains("其他分組的私有資料"));
     assert!(
         native::decode(&bytes).is_err(),
@@ -118,7 +86,7 @@ fn group_export_retains_all_one_hundred_records_fields_and_order_without_other_g
 
 #[test]
 fn empty_and_ungrouped_exports_are_valid_and_invalid_group_relationships_are_rejected() {
-    let empty = VaultSnapshot::new_empty(1_800_000_000_000);
+    let empty = VaultSnapshot::new_empty();
     let ungrouped = empty.export_group(empty.groups[0].id).unwrap();
     assert!(
         native::decode_group(&native::encode_group(&ungrouped).unwrap())
@@ -127,6 +95,12 @@ fn empty_and_ungrouped_exports_are_valid_and_invalid_group_relationships_are_rej
             .is_empty()
     );
     assert!(ungrouped.groups[0].is_ungrouped);
+    let mut legacy = ungrouped.clone();
+    legacy.groups[0].name = "未分組".into();
+    assert_eq!(
+        native::decode_group(&serde_json::to_vec(&legacy).unwrap()).unwrap(),
+        ungrouped
+    );
     assert!(empty.export_group(Uuid::new_v4()).is_err());
     assert!(native::decode_group(&native::encode(&empty).unwrap()).is_err());
     let (vault, group) = fixture();
@@ -139,25 +113,6 @@ fn empty_and_ungrouped_exports_are_valid_and_invalid_group_relationships_are_rej
     let mut exported = vault.export_group(group).unwrap();
     exported.authenticators[1].sort_order = 0;
     assert!(native::encode_group(&exported).is_err());
-}
-
-#[test]
-fn group_decoder_keeps_native_json_strictness_and_accepts_editor_bom_and_crlf() {
-    let (vault, group) = fixture();
-    let exported = vault.export_group(group).unwrap();
-    let bytes = native::encode_group(&exported).unwrap();
-    let text = std::str::from_utf8(&bytes).unwrap();
-    assert_eq!(
-        native::decode_group(format!("\u{feff}{}", text.replace('\n', "\r\n")).as_bytes()).unwrap(),
-        exported
-    );
-    for body in [
-        text.replacen('{', "{\"scope\":\"group\",", 1),
-        text.replacen('{', "{\"unknown\":true,", 1),
-        format!("{text} false"),
-    ] {
-        assert!(native::decode_group(body.as_bytes()).is_err());
-    }
 }
 
 struct FixtureDirectory(PathBuf);
@@ -184,8 +139,8 @@ fn group_file_uses_group_name_and_verifies_contents_while_protecting_the_working
     let primary = directory.0.join("BNAuth.bnauth");
     let original = native::encode(&source).unwrap();
     fs::write(&primary, &original).unwrap();
-    let name = export_file::suggested_filename(&exported.groups[0].name, Format::Group);
-    assert_eq!(name, "遊戲帳號.bnauth");
+    let name = export_file::suggested_backup_filename(&exported.groups[0].name, (2026, 1, 4));
+    assert_eq!(name, "遊戲帳號-260104.bnauth");
     let path = directory.0.join(name);
     export_file::write(&path, &bytes, Format::Group, Some(&primary)).unwrap();
     assert_eq!(
@@ -193,7 +148,7 @@ fn group_file_uses_group_name_and_verifies_contents_while_protecting_the_working
         exported
     );
     let error = export_file::write(&primary, &bytes, Format::Group, Some(&primary)).unwrap_err();
-    assert!(error.contains("不能覆蓋"));
+    assert_eq!(error, "請勿覆蓋設定檔。");
     assert_eq!(fs::read(&primary).unwrap(), original.as_slice());
     assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
 }

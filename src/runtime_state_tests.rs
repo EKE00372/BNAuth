@@ -4,28 +4,41 @@ use std::time::{Duration, Instant};
 #[test]
 fn clock_tooltip_reports_local_fallback_valid_anchor_and_latest_failure() {
     let mut clock = RuntimeClock::new();
-    let text = clock_status_tooltip(&clock, false);
-    assert!(text.contains("所有驗證器共用校時。"));
-    assert!(text.contains("本機時間；尚未校時"));
-    assert!(!text.contains("正在校時"));
-    clock.note_failure("人工連線失敗".into());
-    let text = clock_status_tooltip(&clock, true);
-    assert!(text.contains("正在校時…"));
-    assert!(text.contains("校時失敗，使用本機時間"));
-    assert!(text.contains("最近校時錯誤：人工連線失敗"));
+    let style = Style::default();
+    let tooltip = |clock: &RuntimeClock, syncing| {
+        clock_status_tooltip(clock, syncing, &style, Color32::RED)
+    };
+    let job = tooltip(&clock, false);
+    assert_eq!(job.text, "所有驗證器共用校時。\n尚未校時");
+    assert!(
+        job.sections
+            .iter()
+            .all(|section| section.format.color == Color32::PLACEHOLDER)
+    );
+    clock.note_failure(bnauth_core::ErrorCode::retry_connection().to_string());
+    let job = tooltip(&clock, true);
+    assert_eq!(job.text, "所有驗證器共用校時。\n正在校時\nE11：連線異常，請重試");
+    let (failure, context) = job.sections.split_last().unwrap();
+    let bytes = &failure.byte_range;
+    assert_eq!(&job.text[bytes.start.0..bytes.end.0], "E11：連線異常，請重試");
+    assert_eq!(failure.format.color, Color32::RED);
+    assert!(
+        context
+            .iter()
+            .all(|section| section.format.color == Color32::PLACEHOLDER)
+    );
 
     let sent = Instant::now();
     let wall = bnauth_core::now_ms();
     let sample = bnauth_core::clock::validate_sample(wall, wall, wall, sent, sent).unwrap();
     clock.apply(sample).unwrap();
-    let text = clock_status_tooltip(&clock, false);
-    assert!(text.contains("已校時"));
+    let text = tooltip(&clock, false).text;
+    assert!(text.contains("上次校時："));
     assert!(text.contains("RTT 0 ms"));
-    assert!(!text.contains("最近校時錯誤"));
-    clock.note_failure("人工重新校時逾時".into());
-    let text = clock_status_tooltip(&clock, false);
-    assert!(text.contains("有效校時"));
-    assert!(text.contains("最近校時錯誤：人工重新校時逾時"));
+    assert!(!text.contains("連線異常"));
+    clock.note_failure(bnauth_core::ErrorCode::retry_connection().to_string());
+    let text = tooltip(&clock, false).text;
+    assert_eq!(text, "所有驗證器共用校時。\nE11：連線異常，請重試");
     assert!(clock.is_synced());
 }
 
@@ -74,27 +87,27 @@ fn disk_worker_validation_reload_and_shutdown_preserve_then_release_the_primary_
     let mut app = start(path.clone());
     wait(&mut app);
     assert_eq!(app.phase, Phase::Missing);
-    let empty = VaultSnapshot::new_empty(1_800_000_000_000);
+    let empty = VaultSnapshot::new_empty();
     let candidate = bnauth_core::prepare_import(
         &empty,
         "人工驗證器",
         "",
         empty.groups[0].id,
         bnauth_core::parse_manual("3132333435363738393031323334353637383930", "", "").unwrap(),
-        1_800_000_000_000,
     )
     .unwrap()
-    .candidate;
+    .candidate(&empty)
+    .unwrap();
     app.commit(candidate, false).unwrap();
     wait(&mut app);
-    let first = app.current.clone().unwrap();
+    let first = app.current.as_deref().unwrap().clone();
     assert_write_locked(&path);
 
     // The worker must release the old repository before opening its replacement.
     app.reload().unwrap();
     wait(&mut app);
     assert_eq!(app.phase, Phase::Ready);
-    assert_eq!(app.current.as_ref(), Some(&first));
+    assert_eq!(app.current.as_deref(), Some(&first));
     assert_write_locked(&path);
     assert_eq!(
         bnauth_adapters::native::decode(&fs::read(&path).unwrap()).unwrap(),
@@ -126,7 +139,7 @@ fn disk_worker_validation_reload_and_shutdown_preserve_then_release_the_primary_
     assert!(failed);
     assert!(app.error.as_deref().unwrap().contains("U+0000"));
     assert!(app.has_pending());
-    assert_eq!(app.current.as_ref(), Some(&first));
+    assert_eq!(app.current.as_deref(), Some(&first));
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);
     assert_write_locked(&path);
@@ -153,7 +166,7 @@ fn disk_worker_validation_reload_and_shutdown_preserve_then_release_the_primary_
     fs::write(&path, &*bnauth_adapters::native::encode(&edited).unwrap()).unwrap();
     let mut reopened = start(path.clone());
     wait(&mut reopened);
-    assert_eq!(reopened.current.as_ref(), Some(&edited));
+    assert_eq!(reopened.current.as_deref(), Some(&edited));
     assert_write_locked(&path);
     drop(reopened);
     assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);

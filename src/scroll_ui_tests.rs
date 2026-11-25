@@ -109,7 +109,7 @@ fn replace_query(ui: &mut GroupUi, query: &str) {
 #[test]
 fn search_query_history_keeps_scroll_state_bounded_without_saving() {
     let mut ui = ready_list();
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let token = ui.app.model.change_token();
     ui.app.query = "row".into();
     frame(&mut ui, Vec::new());
@@ -129,7 +129,7 @@ fn search_query_history_keeps_scroll_state_bounded_without_saving() {
         );
         assert_eq!(ui.app.model.change_token(), token);
         let app = &ui.app.runtime.app;
-        assert_eq!(app.current.as_ref(), Some(&original));
+        assert_eq!(app.current.as_deref(), Some(&original));
         assert!(!app.saving && !app.cleaning && !app.has_pending());
     }
 }
@@ -152,15 +152,13 @@ fn changed_query_resets_on_first_frame_and_unchanged_query_keeps_scroll() {
     scroll_down(&mut ui);
     assert!(!ui.points("Row 0999").is_empty());
     // An ordinary model refresh must not reset an unchanged search.
-    let previous_revision = ui.app.runtime.app.current.as_ref().unwrap().revision;
-    let before = ui.app.model.change_token();
-    ui.app.model.add_group("New empty group").unwrap();
-    ui.app.persist_frame_changes(before, &ui.ctx);
+    let previous_revision = ui.app.runtime.app.current.as_deref().unwrap().revision;
+    ui.submit_group("New empty group");
     wait_runtime(&mut ui);
     settle(&mut ui);
     assert!(!ui.points("Row 0999").is_empty());
     assert_eq!(
-        ui.app.runtime.app.current.as_ref().unwrap().revision,
+        ui.app.runtime.app.current.as_deref().unwrap().revision,
         previous_revision + 1
     );
 }
@@ -168,7 +166,7 @@ fn changed_query_resets_on_first_frame_and_unchanged_query_keeps_scroll() {
 #[test]
 fn ordinary_group_scroll_positions_survive_switching_and_search() {
     let mut ui = ready_list();
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let token = ui.app.model.change_token();
     scroll_down(&mut ui);
     assert!(!ui.points("Row 0099").is_empty());
@@ -194,6 +192,6 @@ fn ordinary_group_scroll_positions_survive_switching_and_search() {
     settle(&mut ui);
     assert!(!ui.points("Row 0099").is_empty());
     assert_eq!(ui.app.model.change_token(), token);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
     assert!(!ui.app.runtime.app.saving && !ui.app.runtime.app.has_pending());
 }

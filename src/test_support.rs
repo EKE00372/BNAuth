@@ -4,13 +4,6 @@ use std::time::{Duration, Instant};
 struct DialogMemoryRepository;
 
 impl bnauth_app::Repository for DialogMemoryRepository {
-    fn restore(
-        &mut self,
-        candidate: &bnauth_core::VaultSnapshot,
-    ) -> Result<bnauth_app::CommitOutcome, String> {
-        self.commit(candidate)
-    }
-
     fn commit(
         &mut self,
         candidate: &bnauth_core::VaultSnapshot,
@@ -52,26 +45,30 @@ pub fn runtime(vault: bnauth_core::VaultSnapshot, frame_time: i64) -> crate::run
     }));
     drain_memory_app(&mut app);
     crate::runtime::RuntimeState {
+        ui_ctx: Default::default(),
         app,
+        recovery: Default::default(),
         path: Default::default(),
         clock: bnauth_core::clock::RuntimeClock::new(),
         frame_time,
         sync_rx: None,
         sync_manual: false,
-        export_rx: None,
+        sync_requests: 0,
+        export_job: None,
+        export_cleanup: Default::default(),
         group_import_rx: None,
-        pending_import_group: None,
+        pending_list_edit: None,
+        pending_groups: None,
+        pending_import: None,
         full_restore_rx: None,
         pending_full_restore: false,
         pending_clock_record: None,
         clock_save_inflight: None,
-        pending_clock_invalidation: false,
-        clock_invalidation_inflight: false,
-        invalidated_clock_records: Vec::new(),
         pending_clock_manual: false,
         clock_save_manual: false,
+        pending_clock_merge: false,
         close_requested: false,
-        allow_close_with_residue: false,
+        save_after_cleanup: false,
         clock_notices: Default::default(),
     }
 }

@@ -3,8 +3,7 @@ use bnauth_adapters::{
     native,
 };
 use bnauth_core::{
-    Group, LegacyMetadata, Provenance, RecoveryEvent, Secret, TIME_SOURCE, TimeSyncRecord, Uuid,
-    VaultSnapshot, parse_manual, prepare_import,
+    Group, Secret, TIME_SOURCE, TimeSyncRecord, Uuid, VaultSnapshot, parse_manual, prepare_import,
 };
 use std::{fs, path::PathBuf};
 
@@ -30,7 +29,7 @@ impl Drop for Directory {
 }
 
 fn full_fixture() -> VaultSnapshot {
-    let mut source = VaultSnapshot::new_empty(T);
+    let mut source = VaultSnapshot::new_empty();
     for order in 1..20 {
         source.groups.push(Group {
             id: Uuid::new_v4(),
@@ -50,12 +49,9 @@ fn full_fixture() -> VaultSnapshot {
             "AbCd123456",
         )
         .unwrap(),
-        T,
     )
     .unwrap()
-    .candidate
-    .authenticators
-    .remove(0);
+    .record();
     for index in (0..1000_u64).rev() {
         let mut record = record.clone();
         record.id = Uuid::new_v4();
@@ -63,21 +59,9 @@ fn full_fixture() -> VaultSnapshot {
         record.sort_order = (index % 50) as u32;
         record.name = format!(" 完整標題 {index:04} ");
         let mut key = [0_u8; 20];
-        key[..8].copy_from_slice(&index.to_be_bytes());
-        record.secret = (index % 10 != 0).then(|| Secret::from_bytes(key));
-        record.recovery_history.push(RecoveryEvent {
-            at_ms: T,
-            operation: "restore".into(),
-            outcome: "saved".into(),
-            confirmation: Some("來源確認原文".into()),
-        });
-        record.legacy_metadata.push(LegacyMetadata {
-            source: "fixture".into(),
-            source_version: Some("1".into()),
-            field: "original".into(),
-            original_value: " 完整歷史\r\n原值 ".into(),
-            unit: None,
-        });
+        // Each group repeats the same set of keys; the full backup must retain all copies.
+        key[..8].copy_from_slice(&(index % 50).to_be_bytes());
+        record.secret = Secret::from_bytes(key);
         source.authenticators.push(record);
     }
     source.revision = 42;
@@ -87,13 +71,6 @@ fn full_fixture() -> VaultSnapshot {
         local_wall_ms_at_sample: T - 500,
         offset_ms: 500,
         rtt_ms: 20,
-    });
-    source.provenance.push(Provenance {
-        source_vault_id: Uuid::new_v4(),
-        source_revision: 13,
-        scope: "full".into(),
-        imported_at_ms: T - 1,
-        source_time_sync: source.service_time_sync.battlenet.clone(),
     });
     source.validate().unwrap();
     source
@@ -107,12 +84,13 @@ fn full_backup_write_and_read_preserve_all_twenty_groups_thousand_records_and_or
     let encoded = native::encode(&source).unwrap();
     let primary = directory.0.join("BNAuth.bnauth");
     fs::write(&primary, &encoded).unwrap();
-    let filename = export_file::suggested_filename("BNAuth-full", Format::Full);
-    assert_eq!(filename, "BNAuth-full.bnauth");
+    let filename = export_file::suggested_backup_filename("BNAuth", (2026, 11, 24));
+    assert_eq!(filename, "BNAuth-261124.bnauth");
     assert_eq!(Format::Full.title(), "備份完整資料庫");
     assert_eq!(Format::Full.label(), "完整備份");
     let backup = directory.0.join(filename);
-    export_file::write(&backup, &encoded, Format::Full, Some(&primary)).unwrap();
+    let backup_contents = native::encode_backup_from_validated(&source.file_view()).unwrap();
+    export_file::write(&backup, &backup_contents, Format::Full, Some(&primary)).unwrap();
     let backup_bytes = fs::read(&backup).unwrap();
     let decoded = native::read_full(&backup).unwrap();
     assert_eq!(decoded, source);
@@ -125,15 +103,69 @@ fn full_backup_write_and_read_preserve_all_twenty_groups_thousand_records_and_or
 }
 
 #[test]
-fn full_reader_accepts_bom_crlf_and_empty_database_without_modifying_source_bytes() {
+fn full_reader_accepts_legacy_history_bom_and_crlf_without_modifying_source_bytes() {
     let directory = Directory::new();
-    let source = VaultSnapshot::new_empty(T);
-    let encoded = native::encode(&source).unwrap();
-    let body = std::str::from_utf8(&encoded).unwrap();
+    let empty = VaultSnapshot::new_empty();
+    let source = prepare_import(
+        &empty,
+        "Legacy row",
+        "Saved note",
+        empty.groups[0].id,
+        parse_manual(
+            "3132333435363738393031323334353637383930",
+            "US123456789012",
+            "AB12CD34EF",
+        )
+        .unwrap(),
+    )
+    .unwrap()
+    .candidate(&empty)
+    .unwrap();
+    let mut legacy = serde_json::to_value(&source).unwrap();
+    legacy["created_at_ms"] = T.into();
+    legacy["updated_at_ms"] = (T + 10).into();
+    let row = &mut legacy["authenticators"][0];
+    row["created_at_ms"] = T.into();
+    row["updated_at_ms"] = (T + 5).into();
+    row["source"] = "manual-40".into();
+    row["restore_code_source"] = "manual".into();
+    row["recovery_history"] = serde_json::json!([{
+        "at_ms": T, "operation": "restore", "outcome": "saved", "confirmation": null
+    }]);
+    row["legacy_metadata"] = serde_json::json!([{
+        "source": "WinAuth", "source_version": null, "field": "original",
+        "original_value": "sample", "unit": null
+    }]);
+    let entry = serde_json::json!({
+        "source_vault_id": source.vault_id,
+        "source_revision": 1,
+        "scope": "full",
+        "imported_at_ms": T,
+        "source_time_sync": null,
+    });
+    legacy["provenance"] = serde_json::Value::Array(vec![entry; 1_000]);
+    let body = serde_json::to_string_pretty(&legacy).unwrap();
     let bytes = format!("\u{feff}{}", body.replace('\n', "\r\n")).into_bytes();
     let path = directory.0.join("編輯器另存.bnauth");
     fs::write(&path, &bytes).unwrap();
-    assert_eq!(native::read_full(&path).unwrap(), source);
+    let loaded = native::read_full(&path).unwrap();
+    assert_eq!(loaded, source);
+    let restored = bnauth_core::prepare_full_restore(None, &loaded).unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&native::encode(&restored.candidate).unwrap()).unwrap();
+    for key in ["created_at_ms", "updated_at_ms", "provenance"] {
+        assert!(saved.get(key).is_none(), "{key}");
+    }
+    for key in [
+        "created_at_ms",
+        "updated_at_ms",
+        "source",
+        "restore_code_source",
+        "recovery_history",
+        "legacy_metadata",
+    ] {
+        assert!(saved["authenticators"][0].get(key).is_none(), "{key}");
+    }
     assert_eq!(fs::read(&path).unwrap(), bytes);
 }
 
@@ -141,7 +173,7 @@ fn full_reader_accepts_bom_crlf_and_empty_database_without_modifying_source_byte
 fn full_reader_rejects_partial_invalid_and_oversized_files_and_preserves_the_source() {
     let directory = Directory::new();
     let path = directory.0.join("來源.bnauth");
-    let source = VaultSnapshot::new_empty(T);
+    let source = VaultSnapshot::new_empty();
     let group = source.export_group(source.groups[0].id).unwrap();
     let bytes = native::encode_group(&group).unwrap();
     fs::write(&path, &bytes).unwrap();
@@ -154,7 +186,10 @@ fn full_reader_rejects_partial_invalid_and_oversized_files_and_preserves_the_sou
         .unwrap()
         .set_len(native::MAX_FILE as u64 + 1)
         .unwrap();
-    assert!(native::read_full(&path).unwrap_err().contains("32 MiB"));
+    assert_eq!(
+        native::read_full(&path).unwrap_err(),
+        "E15：檔案過大\n超過 32 MiB 上限。"
+    );
     assert_eq!(
         fs::metadata(&path).unwrap().len(),
         native::MAX_FILE as u64 + 1
@@ -164,14 +199,14 @@ fn full_reader_rejects_partial_invalid_and_oversized_files_and_preserves_the_sou
 #[test]
 fn full_export_protects_the_primary_and_rejects_incorrect_extension() {
     let directory = Directory::new();
-    let source = VaultSnapshot::new_empty(T);
+    let source = VaultSnapshot::new_empty();
     let primary = directory.0.join("BNAuth.bnauth");
     let bytes = native::encode(&source).unwrap();
     fs::write(&primary, &bytes).unwrap();
-    assert!(
+    assert_eq!(
         export_file::write(&primary, &bytes, Format::Full, Some(&primary))
-            .unwrap_err()
-            .contains("不能覆蓋")
+            .unwrap_err(),
+        "請勿覆蓋設定檔。"
     );
     assert!(
         export_file::write(

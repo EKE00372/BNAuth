@@ -19,7 +19,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn manual_import_reopen_copy_and_metadata_edit_preserve_otp_and_identity() {
+fn manual_import_reopen_copy_and_metadata_edit_keep_same_key_records_independent() {
     let dir =
         Fixture(std::env::temp_dir().join(format!("BNAuth-workflow-{}", uuid::Uuid::new_v4())));
     let original_dir = dir.0.join("來源 有愛");
@@ -28,10 +28,7 @@ fn manual_import_reopen_copy_and_metadata_edit_preserve_otp_and_identity() {
     fs::create_dir(&copied_dir).unwrap();
     let path = original_dir.join("BNAuth.bnauth");
     let (mut repo, _) = Repository::open(path.clone()).unwrap();
-    let empty = repo
-        .commit(&VaultSnapshot::new_empty(1_700_000_000_000))
-        .unwrap()
-        .snapshot;
+    let empty = repo.commit(&VaultSnapshot::new_empty()).unwrap().snapshot;
     // RFC 6238's public SHA-1 test key, never an account credential.
     let key = "3132333435363738393031323334353637383930";
     let first = prepare_import(
@@ -40,12 +37,14 @@ fn manual_import_reopen_copy_and_metadata_edit_preserve_otp_and_identity() {
         "備註",
         empty.groups[0].id,
         parse_manual(key, "", "").unwrap(),
-        1_700_000_000_001,
     )
     .unwrap();
-    let imported = repo.commit(&first.candidate).unwrap().snapshot;
+    let imported = repo
+        .commit(&first.candidate(&empty).unwrap())
+        .unwrap()
+        .snapshot;
     assert_eq!(
-        totp(imported.authenticators[0].secret.as_ref().unwrap(), 59_000).unwrap(),
+        totp(&imported.authenticators[0].secret, 59_000).unwrap(),
         "94287082"
     );
     let serial_hex: String = b"US-1234-5678-9012"
@@ -54,47 +53,49 @@ fn manual_import_reopen_copy_and_metadata_edit_preserve_otp_and_identity() {
         .collect();
     let duplicate = prepare_import(
         &imported,
-        "不應取代名稱",
-        "不應取代備註",
+        "重複項目的名稱",
+        "重複項目的備註",
         empty.groups[0].id,
         parse_manual(&format!("{key}{serial_hex}"), "", "AbCd123456").unwrap(),
-        1_700_000_000_002,
     )
     .unwrap();
-    assert!(!duplicate.new_secret);
-    assert!(duplicate.changed);
-    let supplemented = repo.commit(&duplicate.candidate).unwrap().snapshot;
-    assert_eq!(supplemented.authenticators.len(), 1);
     assert_eq!(
-        supplemented.authenticators[0].id,
-        imported.authenticators[0].id
+        duplicate.preview.matches,
+        vec![(
+            empty.groups[0].name.clone(),
+            imported.authenticators[0].name.clone(),
+        )]
     );
-    assert_eq!(
-        supplemented.authenticators[0].name,
-        imported.authenticators[0].name
-    );
-    assert_eq!(
-        supplemented.authenticators[0].serial.as_deref(),
-        Some("US123456789012")
-    );
+    let with_duplicate = repo
+        .commit(&duplicate.candidate(&imported).unwrap())
+        .unwrap()
+        .snapshot;
+    assert_eq!(with_duplicate.authenticators.len(), 2);
+    assert_eq!(with_duplicate.authenticators[0], imported.authenticators[0]);
+    let added = &with_duplicate.authenticators[1];
+    assert_ne!(added.id, imported.authenticators[0].id);
+    assert_eq!(added.name, "重複項目的名稱");
+    assert_eq!(added.description, "重複項目的備註");
+    assert_eq!(added.serial.as_deref(), Some("US123456789012"));
     drop(repo);
     let (repo, reopened) = Repository::open(path.clone()).unwrap();
-    assert_eq!(reopened.as_ref(), Some(&supplemented));
+    assert_eq!(reopened.as_ref(), Some(&with_duplicate));
     drop(repo);
     fs::copy(path, copied_dir.join("BNAuth.bnauth")).unwrap();
     let (mut portable, copied) = Repository::open(copied_dir.join("BNAuth.bnauth")).unwrap();
     let mut changed = copied.unwrap();
-    assert_eq!(changed, supplemented);
-    changed.authenticators[0].name = "改名後仍為同一個驗證器".into();
-    changed.authenticators[0].description.clear();
+    assert_eq!(changed, with_duplicate);
+    changed.authenticators[1].name = "改名後仍為同一個驗證器".into();
+    changed.authenticators[1].description.clear();
     let edited = portable.commit(&changed).unwrap().snapshot;
-    assert_eq!(edited.authenticators[0].id, imported.authenticators[0].id);
+    assert_eq!(edited.authenticators[0], imported.authenticators[0]);
+    assert_eq!(edited.authenticators[1].id, added.id);
     assert_eq!(
-        edited.authenticators[0].restore_code.as_deref(),
+        edited.authenticators[1].restore_code.as_deref(),
         Some("AbCd123456")
     );
     assert_eq!(
-        totp(edited.authenticators[0].secret.as_ref().unwrap(), 59_000).unwrap(),
+        totp(&edited.authenticators[1].secret, 59_000).unwrap(),
         "94287082"
     );
 }

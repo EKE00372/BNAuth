@@ -6,33 +6,54 @@ use zeroize::Zeroizing;
 
 pub const METADATA_NAMESPACE: &str = "urn:bnauth:metadata:1";
 
+/// Check whether a record can be exported as XML without generating the file.
+pub fn validate(record: &Authenticator) -> Result<(), String> {
+    validate_record(record)?;
+    for (_, label, value) in metadata_fields(record, record.serial.as_deref().unwrap_or("")) {
+        if let Some(ch) = value.chars().find(|&ch| !is_xml_character(ch)) {
+            return Err(invalid_xml_character(label, ch));
+        }
+    }
+    Ok(())
+}
+
+fn validate_record(record: &Authenticator) -> Result<(), String> {
+    if record.digits != 8 || record.algorithm != "SHA1" || record.period_secs != 30 {
+        return Err("WinAuth2 匯出需要八位碼、SHA1 與 30 秒週期。".into());
+    }
+    bnauth_core::valid_name(&record.name, MAX_NAME_BYTES, "名稱")?;
+    bnauth_core::bounded(&record.description, MAX_DESCRIPTION_BYTES, "備註")?;
+    if let Some(serial) = &record.serial
+        && bnauth_core::normalize_serial(serial)?.as_deref() != Some(serial.as_str())
+    {
+        return Err("序號尚未正規化，無法匯出。".into());
+    }
+    if let Some(code) = &record.restore_code {
+        bnauth_core::valid_name(code, 64, "還原碼")?;
+    }
+    Ok(())
+}
+
 /// Only committed data should be supplied here. A missing serial stays missing;
 /// the 40-digit seed alone is also a valid WinAuth 2 SecretData value.
 pub fn encode(
     record: &Authenticator,
     time_difference_ms: Option<i64>,
 ) -> Result<Zeroizing<String>, String> {
-    let secret = record
-        .secret
-        .as_ref()
-        .ok_or("尚未取得密鑰，無法匯出可產碼的 WinAuth2 XML。")?;
-    if record.digits != 8 || record.algorithm != "SHA1" || record.period_secs != 30 {
-        return Err("WinAuth2 匯出需要八位碼、SHA1 與 30 秒週期。".into());
-    }
-    bnauth_core::valid_name(&record.name, MAX_NAME_BYTES, "標題")?;
-    bnauth_core::bounded(&record.description, MAX_DESCRIPTION_BYTES, "備註")?;
-    let serial = match &record.serial {
-        Some(serial) => {
-            if bnauth_core::normalize_serial(serial)?.as_deref() != Some(serial.as_str()) {
-                return Err("序號尚未正規化，無法匯出。".into());
-            }
-            display_serial(serial)
-        }
-        None => String::new(),
-    };
-    if let Some(code) = &record.restore_code {
-        bnauth_core::valid_name(code, 64, "還原碼")?;
-    }
+    validate(record)?;
+    Ok(encode_from_validated(record, time_difference_ms))
+}
+
+/// Encode a record that passed the XML preview check and has not been edited.
+pub fn encode_from_validated(
+    record: &Authenticator,
+    time_difference_ms: Option<i64>,
+) -> Zeroizing<String> {
+    let serial = record
+        .serial
+        .as_deref()
+        .map(display_serial)
+        .unwrap_or_default();
 
     let mut xml = Zeroizing::new(String::from(
         "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n\
@@ -57,7 +78,7 @@ pub fn encode(
     xml.push_str("    <secretdata encrypted=\"\">");
     // Write bytes directly into the zeroizing output instead of retaining a
     // second unprotected hexadecimal copy of the seed.
-    for byte in secret.bytes().iter().chain(serial.as_bytes()) {
+    for byte in record.secret.bytes().iter().chain(serial.as_bytes()) {
         write!(xml, "{byte:02X}").unwrap();
     }
     xml.push_str("</secretdata>\n  </authenticator>\n");
@@ -66,25 +87,32 @@ pub fn encode(
         "  <bnauth:metadata xmlns:bnauth=\"{METADATA_NAMESPACE}\" version=\"1\" xml:space=\"preserve\">"
     )
     .unwrap();
-    for (field, label, value) in [
-        ("title", "標題", record.name.as_str()),
+    for (field, _, value) in metadata_fields(record, &serial) {
+        write!(xml, "    <bnauth:{field}>").unwrap();
+        escape_text(&mut xml, value);
+        writeln!(xml, "</bnauth:{field}>").unwrap();
+    }
+    xml.push_str("  </bnauth:metadata>\n</WinAuth>\n");
+    xml
+}
+
+fn metadata_fields<'a>(
+    record: &'a Authenticator,
+    serial: &'a str,
+) -> [(&'static str, &'static str, &'a str); 4] {
+    [
+        ("title", "名稱", record.name.as_str()),
         ("note", "備註", record.description.as_str()),
-        ("serial", "序號", serial.as_str()),
+        ("serial", "序號", serial),
         (
             "restoreCode",
             "還原碼",
             record.restore_code.as_deref().unwrap_or(""),
         ),
-    ] {
-        write!(xml, "    <bnauth:{field}>").unwrap();
-        escape_text(&mut xml, value, label)?;
-        writeln!(xml, "</bnauth:{field}>").unwrap();
-    }
-    xml.push_str("  </bnauth:metadata>\n</WinAuth>\n");
-    Ok(xml)
+    ]
 }
 
-fn escape_text(xml: &mut String, value: &str, label: &str) -> Result<(), String> {
+fn escape_text(xml: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '&' => xml.push_str("&amp;"),
@@ -97,22 +125,24 @@ fn escape_text(xml: &mut String, value: &str, label: &str) -> Result<(), String>
             '\r' => xml.push_str("&#13;"),
             '\n' => xml.push_str("&#10;"),
             '\t' => xml.push_str("&#9;"),
-            '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}' => {
-                xml.push(ch)
-            }
-            _ => {
-                return Err(format!(
-                    "{label}含 XML 1.0 無法保存的字元（U+{:04X}）。",
-                    ch as u32
-                ));
-            }
+            ch => xml.push(ch),
         }
     }
-    Ok(())
+}
+
+fn is_xml_character(ch: char) -> bool {
+    matches!(
+        ch,
+        '\r' | '\n' | '\t' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}'
+    )
+}
+
+fn invalid_xml_character(label: &str, ch: char) -> String {
+    format!("{label}含 XML 1.0 無法保存的字元（U+{:04X}）。", ch as u32)
 }
 
 pub fn suggested_filename(record: &Authenticator) -> String {
-    crate::export_file::suggested_filename(&record.name, crate::export_file::Format::WinAuth2Xml)
+    crate::export_file::suggested_xml_filename(&record.name)
 }
 
 #[cfg(test)]

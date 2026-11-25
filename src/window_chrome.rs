@@ -51,7 +51,7 @@ impl WindowChrome {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+    pub fn show(&mut self, ui: &mut egui::Ui) -> std::sync::Arc<egui::Galley> {
         let ctx = ui.ctx().clone();
         let primary_press = ctx.input(|input| {
             if input.pointer.button_pressed(egui::PointerButton::Primary) {
@@ -83,6 +83,9 @@ impl WindowChrome {
             Sense::hover(),
         );
         ui.spacing_mut().item_spacing.y = spacing;
+        let title_text =
+            ui.painter()
+                .layout_no_wrap("BNAuth".into(), FontId::proportional(13.0), FOREGROUND);
 
         // A separate upper layer keeps window controls usable while an egui Modal
         // blocks the application. It covers only the title, never the form below.
@@ -115,13 +118,12 @@ impl WindowChrome {
                 if self.native_drag_started(ui, &drag, primary_press) {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
-                ui.painter().text(
+                let text_rect = Align2::LEFT_CENTER.anchor_size(
                     Pos2::new(title.left() + 12.0, title.center().y),
-                    Align2::LEFT_CENTER,
-                    "BNAuth",
-                    FontId::proportional(13.0),
-                    FOREGROUND,
+                    title_text.size(),
                 );
+                ui.painter()
+                    .galley(text_rect.min, title_text.clone(), FOREGROUND);
                 for (index, control) in controls.into_iter().enumerate() {
                     let rect = Rect::from_min_size(
                         Pos2::new(controls_left + index as f32 * BUTTON_WIDTH, title.top()),
@@ -174,6 +176,7 @@ impl WindowChrome {
         if !maximized {
             self.resize_edges(&ctx, window, primary_press);
         }
+        title_text
     }
 
     fn native_drag_started(
@@ -554,7 +557,7 @@ mod tests {
                     .filter(|command| matches!(command, ViewportCommand::MinInnerSize(_)))
                     .cloned()
                     .collect::<Vec<_>>(),
-                vec![ViewportCommand::MinInnerSize(Vec2::new(320.0, 452.0))]
+                vec![ViewportCommand::MinInnerSize(Vec2::new(400.0, 572.0))]
             );
             for _ in 0..3 {
                 let commands = ui.frame(Vec::new());
@@ -594,7 +597,7 @@ mod tests {
                 .unwrap()
                 .commands;
             assert!(commands.contains(&ViewportCommand::MaxInnerSize(Vec2::new(2160.0, 3840.0))));
-            assert!(commands.contains(&ViewportCommand::MinInnerSize(Vec2::new(320.0, 452.0))));
+            assert!(commands.contains(&ViewportCommand::MinInnerSize(Vec2::new(400.0, 572.0))));
             assert_eq!(
                 commands
                     .into_iter()

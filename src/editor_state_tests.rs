@@ -17,11 +17,11 @@ enum ImportField {
 impl ImportField {
     fn label(self) -> &'static str {
         match self {
-            Self::Name => "名稱（必填）",
-            Self::Description => "Email／備註（選填）",
-            Self::Secret => "長密鑰（40／74位十六進位）",
-            Self::Serial => "序號（選填；74位資料會自動帶入）",
-            Self::Restore => "還原碼（選填）",
+            Self::Name => "名稱 *",
+            Self::Description => "備註",
+            Self::Secret => "密鑰 *",
+            Self::Serial => "序號",
+            Self::Restore => "還原碼",
         }
     }
 
@@ -49,7 +49,7 @@ fn open_fresh_import(ui: &mut GroupUi) {
 
 fn import_ui() -> GroupUi {
     let mut ui = GroupUi::new();
-    ui.use_memory_vault(bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME));
+    ui.use_memory_vault(bnauth_core::VaultSnapshot::new_empty());
     open_fresh_import(&mut ui);
     ui
 }
@@ -134,11 +134,14 @@ fn assert_draft_undo_still_works(ui: &mut GroupUi, ids: (egui::Id, egui::Id)) {
     assert_eq!(ui.import().name, "Changed draft name");
     assert_eq!(ui.import().secret, SECOND_SECRET);
     assert_eq!(focus_import_field(ui, ImportField::Name), ids.0);
+    assert!(ui.import().preview.is_some());
     command(ui, egui::Key::Z);
     assert_eq!(ui.import().name, "Original draft name");
+    assert!(ui.import().preview.is_some());
     assert_eq!(focus_import_field(ui, ImportField::Secret), ids.1);
     command(ui, egui::Key::Z);
     assert_eq!(ui.import().secret, FIRST_SECRET);
+    assert!(ui.import().preview.is_none());
 }
 
 #[test]
@@ -165,7 +168,7 @@ fn fresh_import_after_actual_close_cannot_undo_canceled_name_or_secret() {
             .runtime
             .app
             .current
-            .as_ref()
+            .as_deref()
             .unwrap()
             .authenticators
             .is_empty()
@@ -174,13 +177,11 @@ fn fresh_import_after_actual_close_cannot_undo_canceled_name_or_secret() {
 }
 
 #[test]
-fn same_import_draft_keeps_name_and_secret_undo_after_preview_and_back() {
+fn same_import_draft_keeps_name_and_secret_undo_after_inline_preview() {
     let mut ui = import_ui();
     let ids = prepare_undoable_draft(&mut ui);
     ui.click(ui.point("預覽匯入"));
     assert!(ui.import().preview.is_some());
-    ui.click(ui.point("返回修改"));
-    assert!(ui.import().preview.is_none());
     assert_draft_undo_still_works(&mut ui, ids);
     assert!(!ui.app.runtime.app.saving);
     assert!(
@@ -188,7 +189,7 @@ fn same_import_draft_keeps_name_and_secret_undo_after_preview_and_back() {
             .runtime
             .app
             .current
-            .as_ref()
+            .as_deref()
             .unwrap()
             .authenticators
             .is_empty()
@@ -229,13 +230,13 @@ fn repeated_import_sessions_reuse_editor_ids_and_release_stored_states() {
 }
 
 #[test]
-fn formatted_serial_keeps_paste_and_edit_undo_through_preview_and_back() {
+fn formatted_serial_keeps_paste_and_edit_undo_through_inline_preview() {
     let mut ui = import_ui();
     replace_field(&mut ui, ImportField::Name, "Serial undo draft");
     replace_field(&mut ui, ImportField::Secret, FIRST_SECRET);
     let id = focus_import_field(&mut ui, ImportField::Serial);
     ui.frame(vec![egui::Event::Paste("us140403118994".into())]);
-    assert_eq!(ui.import().serial, "US-1404-0311-8994");
+    assert_eq!(ui.import().serial, "us140403118994");
 
     command(&mut ui, egui::Key::Z);
     assert!(
@@ -243,21 +244,21 @@ fn formatted_serial_keeps_paste_and_edit_undo_through_preview_and_back() {
         "one undo must remove the paste"
     );
     command(&mut ui, egui::Key::Y);
-    assert_eq!(ui.import().serial, "US-1404-0311-8994");
-    assert_eq!(cursor_indices(&ui, id), (17, 17));
+    assert_eq!(ui.import().serial, "us140403118994");
+    assert_eq!(cursor_indices(&ui, id), (14, 14));
     settle_undo(&mut ui);
 
     ui.key(egui::Key::Backspace);
     ui.type_text("5");
     settle_undo(&mut ui);
-    assert_eq!(ui.import().serial, "US-1404-0311-8995");
+    assert_eq!(ui.import().serial, "us140403118995");
     ui.click(ui.point("預覽匯入"));
     assert!(ui.import().preview.is_some());
-    ui.click(ui.point("返回修改"));
-    assert!(ui.import().preview.is_none());
+    assert_eq!(ui.import().serial, "US-1404-0311-8995");
     assert_eq!(focus_import_field(&mut ui, ImportField::Serial), id);
     command(&mut ui, egui::Key::Z);
-    assert_eq!(ui.import().serial, "US-1404-0311-8994");
+    assert_eq!(ui.import().serial, "us140403118995");
+    assert!(ui.import().preview.is_none());
     command(&mut ui, egui::Key::Y);
     assert_eq!(ui.import().serial, "US-1404-0311-8995");
     assert_eq!(cursor_indices(&ui, id), (17, 17));

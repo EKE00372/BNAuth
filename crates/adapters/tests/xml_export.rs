@@ -28,7 +28,7 @@ impl Drop for Fixture {
 #[test]
 fn exports_unicode_file_replaces_existing_xml_and_never_overwrites_native_data() {
     let dir = Fixture::new();
-    let vault = VaultSnapshot::new_empty(1_800_000_000_000);
+    let vault = VaultSnapshot::new_empty();
     let vault = prepare_import(
         &vault,
         "測試 & 測試",
@@ -40,10 +40,10 @@ fn exports_unicode_file_replaces_existing_xml_and_never_overwrites_native_data()
             "AB12CD34EF",
         )
         .unwrap(),
-        1_800_000_000_000,
     )
     .unwrap()
-    .candidate;
+    .candidate(&vault)
+    .unwrap();
     let original = vault.clone();
     let xml = winauth2::encode(&vault.authenticators[0], None).unwrap();
     let path = dir.0.join("人工 匯出.XML");
@@ -72,7 +72,11 @@ fn locked_destination_fails_without_damaging_it_or_leaving_plaintext_temporary_f
         .share_mode(0)
         .open(&path)
         .unwrap();
-    assert!(export_file::write(&path, b"<WinAuth />", Format::WinAuth2Xml, None).is_err());
+    let error = export_file::write(&path, b"<WinAuth />", Format::WinAuth2Xml, None).unwrap_err();
+    assert_eq!(
+        error,
+        bnauth_core::ErrorCode::FileInUse.notice().to_string()
+    );
     drop(locked);
     assert_eq!(fs::read(&path).unwrap(), b"previous export");
     assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1);

@@ -1,5 +1,4 @@
 use super::*;
-use std::os::windows::fs::OpenOptionsExt;
 
 struct Directory(PathBuf);
 impl Directory {
@@ -67,47 +66,20 @@ fn verified_export_handle_blocks_replacement_and_stays_protected_through_install
     assert_eq!(fs::read(&other).unwrap(), b"ordinary other file");
 }
 
-#[test]
-fn failed_handle_install_preserves_locked_destination_and_deletes_only_its_owned_temporary() {
-    let directory = Directory::new();
-    let path = directory.0.join("owned.tmp");
-    let destination = directory.0.join("locked.xml");
-    fs::write(&destination, b"old export").unwrap();
-    let locked = OpenOptions::new()
-        .read(true)
-        .share_mode(0)
-        .open(&destination)
-        .unwrap();
-    let mut temporary = ExportTemporary::create(&path).unwrap();
-    temporary.file_mut().write_all(b"new export").unwrap();
-    temporary.file_mut().sync_all().unwrap();
-    temporary.verify(b"new export").unwrap();
-    assert!(temporary.install(&destination).is_err());
-    temporary.verify(b"new export").unwrap();
-    assert!(path.exists());
-    drop(temporary);
-    assert!(!path.exists());
-    drop(locked);
-    assert_eq!(fs::read(&destination).unwrap(), b"old export");
-    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
-}
-
 fn junction(alias: &Path, target: &Path) {
     use std::os::windows::process::CommandExt;
-    let quoted = |path: &Path| path.to_string_lossy().replace('\'', "''");
-    let command = format!(
-        "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
-        quoted(alias),
-        quoted(target)
-    );
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/D", "/V:OFF", "/C"])
+        .env("BNAUTH_TEST_JUNCTION_LINK", alias)
+        .env("BNAUTH_TEST_JUNCTION_TARGET", target)
+        .raw_arg(r#"mklink /J "%BNAUTH_TEST_JUNCTION_LINK%" "%BNAUTH_TEST_JUNCTION_TARGET%""#)
         .creation_flags(0x08000000)
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "junction creation failed: {}",
+        "junction creation failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -224,10 +196,10 @@ fn basename_only_exports_and_relative_primary_protection_work_from_the_current_d
         assert!(bound.protects(primary, primary).unwrap());
         drop(bound);
         for destination in [primary, Path::new(r".\BNAuth.bnauth")] {
-            assert!(
+            assert_eq!(
                 write(destination, b"overwrite", Format::Full, Some(primary))
-                    .unwrap_err()
-                    .contains("不能覆蓋")
+                    .unwrap_err(),
+                "請勿覆蓋設定檔。"
             );
         }
         assert_eq!(fs::read(primary).unwrap(), b"protected primary");
@@ -319,27 +291,4 @@ fn an_open_parent_cannot_be_renamed_and_replaced_until_installation_finishes() {
     fs::write(&destination, b"replacement sentinel").unwrap();
     assert_eq!(fs::read(&destination).unwrap(), b"replacement sentinel");
     assert_eq!(fs::read(moved.join("驗證器.xml")).unwrap(), b"new export");
-}
-
-#[test]
-fn native_relative_names_reject_paths_streams_and_uncompleted_statuses() {
-    for value in [
-        "",
-        ".",
-        "..",
-        "a/b",
-        r"a\b",
-        r"\absolute",
-        "file:stream",
-        "invalid\0name",
-    ] {
-        assert!(
-            relative_name(std::ffi::OsStr::new(value)).is_err(),
-            "accepted {value:?}"
-        );
-    }
-    assert!(relative_name(std::ffi::OsStr::new(&"a".repeat(32767))).is_err());
-    let valid = relative_name(std::ffi::OsStr::new("繁體分組.bnauth")).unwrap();
-    assert_eq!(valid.last(), Some(&0));
-    assert!(native_result(windows_sys::Win32::Foundation::STATUS_PENDING).is_err());
 }

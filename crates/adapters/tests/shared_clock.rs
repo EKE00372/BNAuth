@@ -5,7 +5,7 @@ use bnauth_adapters::{
     winauth2,
 };
 use bnauth_core::{
-    Group, TIME_SOURCE, TimeSyncRecord, Uuid, VaultSnapshot,
+    Group, Secret, TIME_SOURCE, TimeSyncRecord, Uuid, VaultSnapshot,
     clock::{RuntimeClock, system_now_ms},
     parse_manual, prepare_import,
 };
@@ -34,7 +34,7 @@ impl Drop for Directory {
 
 fn fixture(offset_ms: i64) -> VaultSnapshot {
     const SAMPLE_TIME: i64 = 1_800_000_000_000;
-    let mut snapshot = VaultSnapshot::new_empty(SAMPLE_TIME);
+    let mut snapshot = VaultSnapshot::new_empty();
     for (index, name) in ["原始分組", "空分組"].into_iter().enumerate() {
         snapshot.groups.push(Group {
             id: Uuid::new_v4(),
@@ -54,27 +54,27 @@ fn fixture(offset_ms: i64) -> VaultSnapshot {
             "AbCd123456",
         )
         .unwrap(),
-        SAMPLE_TIME,
     )
     .unwrap()
-    .candidate;
-    let mut seedless = snapshot.authenticators[0].clone();
-    seedless.id = Uuid::new_v4();
-    seedless.name = "組內尚無密鑰".into();
-    seedless.secret = None;
-    seedless.sort_order = 1;
-    snapshot.authenticators.push(seedless.clone());
-    seedless.id = Uuid::new_v4();
-    seedless.group_id = snapshot.groups[0].id;
-    seedless.sort_order = 0;
-    seedless.name = "未分組尚無密鑰".into();
-    snapshot.authenticators.push(seedless);
+    .candidate(&snapshot)
+    .unwrap();
+    let mut second = snapshot.authenticators[0].clone();
+    second.id = Uuid::new_v4();
+    second.name = "原始分組的第二個驗證器".into();
+    second.secret = Secret::from_bytes([2; 20]);
+    second.sort_order = 1;
+    snapshot.authenticators.push(second.clone());
+    second.id = Uuid::new_v4();
+    second.group_id = snapshot.groups[0].id;
+    second.sort_order = 0;
+    second.name = "未分組的驗證器".into();
+    snapshot.authenticators.push(second);
     snapshot.service_time_sync.battlenet = Some(TimeSyncRecord {
         source: TIME_SOURCE.into(),
         server_time_ms: SAMPLE_TIME + offset_ms,
         local_wall_ms_at_sample: SAMPLE_TIME,
         offset_ms,
-        rtt_ms: 40,
+        rtt_ms: 3_000,
     });
     snapshot.validate().unwrap();
     snapshot
@@ -90,6 +90,11 @@ fn disk_reopen_uses_the_same_shared_calibration_for_rows_backups_and_xml_includi
         let (mut repository, missing) = Repository::open(primary.clone()).unwrap();
         assert!(missing.is_none());
         let saved = repository.commit(&source).unwrap().snapshot;
+        assert!(std::ptr::eq(&*saved.groups, &*source.groups));
+        assert!(std::ptr::eq(
+            &*saved.authenticators,
+            &*source.authenticators
+        ));
         drop(repository);
 
         let (repository, reopened) = Repository::open(primary.clone()).unwrap();
@@ -100,7 +105,7 @@ fn disk_reopen_uses_the_same_shared_calibration_for_rows_backups_and_xml_includi
         assert_eq!(reopened.service_time_sync.battlenet, expected_calibration);
         let mut shared_clock =
             RuntimeClock::from_saved(reopened.service_time_sync.battlenet.as_ref()).unwrap();
-        assert!(shared_clock.is_from_saved());
+        assert!(shared_clock.is_synced());
         assert_eq!(shared_clock.offset_ms(), Some(offset_ms));
         let local_before = system_now_ms();
         let corrected_now = shared_clock.now_ms();
@@ -112,19 +117,17 @@ fn disk_reopen_uses_the_same_shared_calibration_for_rows_backups_and_xml_includi
             "reopened clock must apply the saved offset to today's time"
         );
         assert_eq!(shared_clock.last_success(), expected_calibration.as_ref());
-        for record in &reopened.authenticators {
+        for record in reopened.authenticators.iter() {
             assert!(
                 reopened
                     .groups
                     .iter()
                     .any(|group| group.id == record.group_id)
             );
-            if record.secret.is_some() {
-                let xml = winauth2::encode(record, shared_clock.offset_ms()).unwrap();
-                let xml_offset = if offset_ms == 0 { 1 } else { offset_ms };
-                assert!(xml.contains(&format!("<servertimediff>{xml_offset}</servertimediff>")));
-                assert_eq!(shared_clock.offset_ms(), Some(offset_ms));
-            }
+            let xml = winauth2::encode(record, shared_clock.offset_ms()).unwrap();
+            let xml_offset = if offset_ms == 0 { 1 } else { offset_ms };
+            assert!(xml.contains(&format!("<servertimediff>{xml_offset}</servertimediff>")));
+            assert_eq!(shared_clock.offset_ms(), Some(offset_ms));
         }
 
         let full_backup = directory.0.join("完整備份.bnauth");

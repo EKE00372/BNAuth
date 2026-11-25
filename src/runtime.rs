@@ -1,46 +1,58 @@
+use crate::otp_cache::PreviewCode;
 use bnauth_app::{Application, CommitOutcome, Repository};
 use bnauth_core::{
-    ImportPreview, VaultSnapshot,
+    ImportPreview, TimeSyncRecord, VaultSnapshot,
     clock::{ClockStatus, RuntimeClock, SyncSample},
 };
-use eframe::egui::{Context, Pos2, Rect, Vec2, ViewportCommand};
-use std::{path::PathBuf, sync::mpsc::Receiver};
+use eframe::egui::{
+    Color32, Context, FontSelection, Pos2, Rect, Style, Vec2, ViewportCommand,
+    text::{LayoutJob, TextFormat},
+};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc::Receiver},
+};
 use zeroize::Zeroize;
 
 // Full client size, including the custom title bar, in logical points.
 pub const DEFAULT_WINDOW_WIDTH: u32 = 400;
 pub const DEFAULT_WINDOW_HEIGHT: u32 = 860 + crate::window_chrome::TITLE_BAR_HEIGHT as u32;
-pub const MIN_WINDOW_WIDTH: u32 = 320;
-pub const MIN_WINDOW_HEIGHT: u32 = 420 + crate::window_chrome::TITLE_BAR_HEIGHT as u32;
+pub const MIN_WINDOW_WIDTH: u32 = 400;
+pub const MIN_WINDOW_HEIGHT: u32 = 540 + crate::window_chrome::TITLE_BAR_HEIGHT as u32;
 pub const MAX_WINDOW_WIDTH: u32 = 2160;
 pub const MAX_WINDOW_HEIGHT: u32 = 3840;
 
 struct DiskRepository(bnauth_adapters::storage::Repository);
+fn disk_outcome(saved: bnauth_adapters::storage::CommitOutcome) -> CommitOutcome {
+    CommitOutcome {
+        snapshot: saved.snapshot,
+        warning: saved.warning,
+    }
+}
+
 impl Repository for DiskRepository {
     fn state(&self) -> bnauth_app::RepositoryState {
         bnauth_app::RepositoryState {
             cleanup_required: self.0.cleanup_required(),
             blocked: self.0.is_blocked(),
+            read_only: self.0.is_read_only(),
         }
     }
 
-    fn commit(&mut self, candidate: &bnauth_core::VaultSnapshot) -> Result<CommitOutcome, String> {
-        self.0.commit(candidate).map(|r| CommitOutcome {
-            snapshot: r.snapshot,
-            warning: r.warning,
-        })
+    fn commit(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
+        self.0.commit(candidate).map(disk_outcome)
+    }
+    fn commit_edit(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
+        self.0.commit_edit(candidate).map(disk_outcome)
     }
     fn retry_cleanup(&mut self) -> Result<(), String> {
         self.0.retry_cleanup()
     }
-    fn restore(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
-        self.0.restore(candidate).map(|r| CommitOutcome {
-            snapshot: r.snapshot,
-            warning: r.warning,
-        })
+    fn defer_cleanup(&mut self) {
+        self.0.defer_cleanup();
     }
-    fn last_restore_backup(&self) -> Option<PathBuf> {
-        self.0.restore_backup().map(|path| path.to_path_buf())
+    fn restore_from_preview(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
+        self.0.restore_from_preview(candidate).map(disk_outcome)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,22 +62,36 @@ struct WindowGeometry {
     position: Pos2,
 }
 
-pub fn clock_status_tooltip(clock: &RuntimeClock, syncing: bool) -> String {
-    let mut text = String::from("所有驗證器共用校時。\n");
+pub const SYNCING_NOTICE: &str = "正在校時";
+
+pub fn clock_status_tooltip(
+    clock: &RuntimeClock,
+    syncing: bool,
+    style: &Style,
+    error_color: Color32,
+) -> LayoutJob {
+    let normal = TextFormat {
+        font_id: FontSelection::Default.resolve(style),
+        color: Color32::PLACEHOLDER,
+        ..Default::default()
+    };
+    let mut text = LayoutJob::default();
+    text.append("所有驗證器共用校時。\n", 0.0, normal.clone());
     if syncing {
-        text.push_str("正在校時…\n");
+        text.append(SYNCING_NOTICE, 0.0, normal.clone());
+        text.append("\n", 0.0, normal.clone());
     }
-    text.push_str(&clock.status_text());
-    if let Some(error) = clock.last_error() {
-        text.push_str("\n最近校時錯誤：");
-        text.push_str(error);
-    }
+    let color = if clock.status() == ClockStatus::Discontinuous || clock.last_error().is_some() {
+        error_color
+    } else {
+        normal.color
+    };
+    text.append(&clock.status_text(), 0.0, TextFormat { color, ..normal });
     text
 }
 
 #[derive(Default)]
 pub struct ClockStatusNotices {
-    previous: Option<ClockStatus>,
     reported_during_sync: bool,
 }
 
@@ -75,29 +101,18 @@ impl ClockStatusNotices {
         self.reported_during_sync = false;
     }
 
-    /// Call after sampling clock.now_ms(), which can invalidate a previous anchor.
     /// Coalesce a rejected sample with a warning for the same discontinuity,
     /// including when the clock change was observed on an earlier frame.
-    pub fn observe(
+    pub fn should_report_discontinuity(
         &mut self,
-        status: ClockStatus,
-        specific_sync_rejection: Option<String>,
-    ) -> Option<String> {
-        let newly_discontinuous = status == ClockStatus::Discontinuous
-            && self.previous != Some(ClockStatus::Discontinuous);
-        self.previous = Some(status);
-        if let Some(error) = specific_sync_rejection {
-            if self.reported_during_sync {
-                return None;
-            }
+        observed_jump: bool,
+        sync_rejected: bool,
+    ) -> bool {
+        if observed_jump || (sync_rejected && !self.reported_during_sync) {
             self.reported_during_sync = true;
-            return Some(error);
-        }
-        if newly_discontinuous {
-            self.reported_during_sync = true;
-            Some("時間不連續，已改用本機時間；請手動校時。".to_owned())
+            true
         } else {
-            None
+            false
         }
     }
 }
@@ -300,109 +315,195 @@ fn primary_monitor_work_area(_pixels_per_point: f32) -> Option<Rect> {
     None
 }
 
+pub enum ListEdit {
+    EditEntry(usize),
+    Copy(u64),
+    Move(crate::model::GroupOrderEdit),
+    Reorder(crate::model::GroupOrderEdit),
+    Delete(crate::model::EntryDeletion),
+}
+
+pub enum PendingImport {
+    FromKey,
+    FromEmail,
+    Group,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExportStage {
+    ChoosePath,
+    WriteFile,
+}
+
+pub struct ExportJob {
+    pub stage: ExportStage,
+    pub result: Receiver<Result<Option<PathBuf>, String>>,
+}
+
+/// Wake the event loop after the result is available, including a disconnected worker.
+pub(crate) struct WorkerReply<T> {
+    sender: Option<std::sync::mpsc::Sender<T>>,
+    ctx: Context,
+}
+
+pub(crate) fn worker_channel<T>(ctx: &Context) -> (WorkerReply<T>, Receiver<T>) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    (
+        WorkerReply {
+            sender: Some(sender),
+            ctx: ctx.clone(),
+        },
+        receiver,
+    )
+}
+
+impl<T> WorkerReply<T> {
+    pub(crate) fn send(mut self, result: T) {
+        let _ = self.sender.take().unwrap().send(result);
+    }
+}
+
+impl<T> Drop for WorkerReply<T> {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        self.ctx.request_repaint();
+    }
+}
+
 pub struct RuntimeState {
+    pub ui_ctx: Context,
     pub app: Application,
+    pub recovery: crate::app::email_recovery::Recovery,
     pub path: PathBuf,
     pub clock: RuntimeClock,
     pub frame_time: i64,
     pub sync_rx: Option<Receiver<Result<SyncSample, bnauth_adapters::time_sync::SyncFailure>>>,
     pub sync_manual: bool,
-    pub export_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
-    pub group_import_rx: Option<Receiver<Result<Option<GroupImportFile>, String>>>,
-    pub pending_import_group: Option<uuid::Uuid>,
+    #[cfg(test)]
+    pub sync_requests: usize,
+    pub export_job: Option<ExportJob>,
+    pub export_cleanup: Arc<Mutex<bnauth_adapters::export_file::ExportCleanup>>,
+    pub group_import_rx: Option<Receiver<Result<Option<GroupImportResponse>, String>>>,
+    pub pending_list_edit: Option<ListEdit>,
+    pub pending_groups: Option<Box<crate::model::GroupDraft>>,
+    pub pending_import: Option<PendingImport>,
     pub full_restore_rx:
         Option<Receiver<Result<Option<crate::app::full_restore::RestoreFile>, String>>>,
     pub pending_full_restore: bool,
     pub pending_clock_record: Option<bnauth_core::TimeSyncRecord>,
     pub clock_save_inflight: Option<bnauth_core::TimeSyncRecord>,
-    pub pending_clock_invalidation: bool,
-    pub clock_invalidation_inflight: bool,
-    pub invalidated_clock_records: Vec<bnauth_core::TimeSyncRecord>,
     pub pending_clock_manual: bool,
     pub clock_save_manual: bool,
+    pub pending_clock_merge: bool,
     pub close_requested: bool,
-    pub allow_close_with_residue: bool,
+    pub save_after_cleanup: bool,
     pub clock_notices: ClockStatusNotices,
 }
 
-/// Storage values associated with the old clock before a load/restore ACK can
-/// replace Application.current or remove the in-flight calibration marker.
-pub(crate) struct ClockStorageContext {
-    saved: Option<bnauth_core::TimeSyncRecord>,
-    inflight: Option<bnauth_core::TimeSyncRecord>,
-}
-
 impl RuntimeState {
-    pub(crate) fn clock_storage_context(&self) -> ClockStorageContext {
-        ClockStorageContext {
-            saved: self
+    pub fn commit_with_pending_clock(
+        &mut self,
+        candidate: VaultSnapshot,
+        import: Option<PendingImport>,
+    ) -> Result<(), String> {
+        self.commit_prepared_with_pending_clock(import, || candidate)
+    }
+
+    pub fn commit_prepared_with_pending_clock(
+        &mut self,
+        import: Option<PendingImport>,
+        take_candidate: impl FnOnce() -> VaultSnapshot,
+    ) -> Result<(), String> {
+        let record = self.pending_clock_record.clone();
+        let mut queued = false;
+        let result = self.app.commit_edit(import.is_some(), || {
+            let mut candidate = take_candidate();
+            if record.is_some() {
+                candidate.service_time_sync.battlenet.clone_from(&record);
+            }
+            queued = true;
+            candidate
+        });
+        if queued {
+            self.pending_import = import;
+            self.pending_clock_merge = true;
+            self.clock_save_manual = record.is_some() && self.pending_clock_manual;
+            self.clock_save_inflight = record;
+        }
+        result
+    }
+
+    pub fn retry_pending_save(&mut self) -> Result<(), String> {
+        if self.app.repository_state.cleanup_required && self.app.has_pending() {
+            self.app.retry_cleanup()?;
+            self.save_after_cleanup = true;
+            return Ok(());
+        }
+        let invalid_backup =
+            self.pending_full_restore && Self::unusable_backup_clock(self.app.pending_time_sync());
+        let merge_clock = self.pending_clock_merge || invalid_backup;
+        let clock_only =
+            !merge_clock && !self.pending_full_restore && self.clock_save_inflight.is_some();
+        let record = if self.pending_full_restore && merge_clock {
+            self.clock.last_success().cloned()
+        } else if clock_only || merge_clock {
+            self.pending_clock_record.clone()
+        } else {
+            None
+        };
+
+        if clock_only
+            && self
                 .app
                 .current
                 .as_ref()
-                .and_then(|snapshot| snapshot.service_time_sync.battlenet.clone()),
-            inflight: self.clock_save_inflight.clone(),
+                .is_some_and(|snapshot| snapshot.service_time_sync.battlenet == record)
+        {
+            self.app.discard();
+            self.clear_pending_clock_save();
+            return Ok(());
         }
+        if !clock_only && record.is_none() && !invalid_backup {
+            return self.app.retry();
+        }
+
+        self.app.retry_with_clock(record.clone())?;
+        self.pending_clock_merge = merge_clock;
+        self.clock_save_manual = record.is_some() && self.pending_clock_manual;
+        self.clock_save_inflight = record;
+        Ok(())
     }
 
-    /// A wall-clock step invalidates every calibration still able to become the
-    /// saved value, not just the newest live sample. Keep these tombstones for
-    /// this process so restoring an old backup cannot make them valid again.
-    /// A fresh apply can first discover the old clock step while already leaving
-    /// a valid new live sample; that sample and its pending save must survive.
-    #[cfg(test)]
-    pub fn note_clock_invalidation(&mut self, preserve_fresh_sample: bool) {
-        let context = self.clock_storage_context();
-        self.note_clock_invalidation_from(preserve_fresh_sample, &context);
+    pub(crate) fn clear_pending_clock_save(&mut self) {
+        self.pending_clock_record = None;
+        self.clock_save_inflight = None;
+        self.pending_clock_manual = false;
+        self.clock_save_manual = false;
     }
 
-    pub(crate) fn note_clock_invalidation_from(
-        &mut self,
-        preserve_fresh_sample: bool,
-        context: &ClockStorageContext,
-    ) {
-        let records = [
-            context.saved.clone(),
-            if preserve_fresh_sample {
-                None
-            } else {
-                self.clock.last_success().cloned()
-            },
-            context.inflight.clone(),
-            if preserve_fresh_sample {
-                None
-            } else {
-                self.pending_clock_record.clone()
-            },
-        ];
-        for record in records.into_iter().flatten() {
-            if !self.invalidated_clock_records.contains(&record) {
-                self.invalidated_clock_records.push(record);
-            }
-        }
-        if !preserve_fresh_sample {
-            self.pending_clock_record = None;
-            if self.app.phase == bnauth_app::Phase::Ready {
-                self.pending_clock_invalidation = true;
-            }
-            self.pending_clock_manual = false;
-            self.clock_save_manual = false;
-        }
+    pub(crate) fn unusable_backup_clock(record: Option<&TimeSyncRecord>) -> bool {
+        record.is_some_and(|record| {
+            bnauth_core::clock::saved_time_ms(record, bnauth_core::now_ms()).is_none()
+        })
+    }
+
+    pub fn file_job_in_progress(&self) -> bool {
+        self.export_job.is_some()
+            || self.group_import_rx.is_some()
+            || self.full_restore_rx.is_some()
     }
 
     pub fn close_blocked(&self) -> bool {
         self.app.saving
             || self.app.cleaning
-            || self.export_rx.is_some()
-            || self.group_import_rx.is_some()
-            || self.full_restore_rx.is_some()
-            || ((self.pending_clock_record.is_some() || self.pending_clock_invalidation)
-                && !self.allow_close_with_residue)
+            || self.recovery.in_progress()
+            || self.file_job_in_progress()
+            || (self.pending_clock_record.is_some() && self.app.repository_state.allows_writes())
             || self.app.has_pending()
-            || ((self.app.warning.is_some() || self.app.repository_state.needs_attention())
-                && !self.allow_close_with_residue)
+            || (self.app.warning.is_some() && !self.app.repository_state.blocked)
     }
 
-    pub fn new() -> Self {
+    pub fn new(ui_ctx: Context) -> Self {
         let location = std::env::current_exe()
             .map_err(|_| "無法取得程式所在目錄。".to_owned())
             .and_then(|exe| {
@@ -411,41 +512,59 @@ impl RuntimeState {
                     .ok_or("無法取得資料檔位置。".to_owned())
             });
         let path = location.clone().unwrap_or_default();
-        let app = Application::start(Box::new(move || {
-            let path = location.clone()?;
-            let (repository, snapshot) = bnauth_adapters::storage::Repository::open(path)?;
-            Ok((Box::new(DiskRepository(repository)), snapshot))
-        }));
+        let wake = ui_ctx.clone();
+        let app = Application::start_with_notify(
+            Box::new(move || {
+                let path = location.clone()?;
+                let (repository, snapshot) = bnauth_adapters::storage::Repository::open(path)?;
+                Ok((Box::new(DiskRepository(repository)), snapshot))
+            }),
+            move || wake.request_repaint(),
+        );
         Self {
+            ui_ctx,
             app,
+            recovery: crate::app::email_recovery::Recovery::default(),
             path,
             clock: RuntimeClock::new(),
             frame_time: bnauth_core::now_ms(),
             sync_rx: None,
             sync_manual: false,
-            export_rx: None,
+            #[cfg(test)]
+            sync_requests: 0,
+            export_job: None,
+            export_cleanup: Default::default(),
             group_import_rx: None,
-            pending_import_group: None,
+            pending_list_edit: None,
+            pending_groups: None,
+            pending_import: None,
             full_restore_rx: None,
             pending_full_restore: false,
             pending_clock_record: None,
             clock_save_inflight: None,
-            pending_clock_invalidation: false,
-            clock_invalidation_inflight: false,
-            invalidated_clock_records: Vec::new(),
             pending_clock_manual: false,
             clock_save_manual: false,
+            pending_clock_merge: false,
             close_requested: false,
-            allow_close_with_residue: false,
+            save_after_cleanup: false,
             clock_notices: ClockStatusNotices::default(),
         }
     }
 }
 pub struct GroupImportFile {
     pub path: PathBuf,
-    pub group_name: String,
+    pub source_group: String,
     pub source_count: usize,
-    pub preview: Result<bnauth_core::GroupImportPreview, String>,
+    pub preview: Option<Box<bnauth_core::GroupImportPreview>>,
+    pub preview_code: PreviewCode,
+}
+
+pub enum GroupImportResponse {
+    Selected {
+        path: PathBuf,
+        source: Box<bnauth_core::ValidatedBackup>,
+    },
+    Prepared(Box<bnauth_core::GroupImportPreview>),
 }
 
 #[derive(Default)]
@@ -463,7 +582,14 @@ pub struct ImportForm {
     pub group: u64,
     pub error: String,
     pub preview: Option<ImportPreview>,
-    pub inferred_serial: Option<String>,
+    pub preview_code: PreviewCode,
+    pub reveal_preview: bool,
+    pub serial_is_embedded: bool,
+    pub packed_key: Option<Result<bnauth_core::ManualMaterial, String>>,
+    pub invalid_name: bool,
+    pub invalid_secret: bool,
+    pub invalid_serial: bool,
+    pub invalid_restore: bool,
 }
 impl ImportForm {
     pub fn new(group: u64) -> Self {
@@ -476,32 +602,50 @@ impl ImportForm {
             group,
             error: String::new(),
             preview: None,
-            inferred_serial: None,
+            preview_code: PreviewCode::default(),
+            reveal_preview: false,
+            serial_is_embedded: false,
+            packed_key: None,
+            invalid_name: false,
+            invalid_secret: false,
+            invalid_serial: false,
+            invalid_restore: false,
         }
+    }
+
+    pub fn take_preview(&mut self) -> Option<ImportPreview> {
+        self.preview_code = PreviewCode::default();
+        self.reveal_preview = false;
+        self.preview.take()
     }
 
     pub fn prepare_preview(
         &mut self,
         vault: &VaultSnapshot,
-        group: uuid::Uuid,
-        now_ms: i64,
+        group: impl Into<bnauth_core::ImportGroup>,
     ) -> Result<(), String> {
         // Drop a stale candidate before parsing so an error can never confirm it.
-        self.preview = None;
-        let material = bnauth_core::parse_manual(&self.secret, &self.serial, &self.restore)?;
-        if self.name.trim().is_empty()
-            && let Some(serial) = &material.serial
-        {
-            self.name = bnauth_core::display_serial(serial);
-        }
-        self.preview = Some(bnauth_core::prepare_import(
-            vault,
-            &self.name,
-            &self.description,
-            group,
-            material,
-            now_ms,
-        )?);
+        drop(self.take_preview());
+        let serial = if self.serial_is_embedded {
+            Ok(None)
+        } else {
+            bnauth_core::submit_serial_input(&mut self.serial, false)
+        };
+        let restore = bnauth_core::submit_restore_input(&mut self.restore, false);
+        self.invalid_serial = serial.is_err();
+        self.invalid_restore = restore.is_err();
+        let key = self
+            .packed_key
+            .clone()
+            .unwrap_or_else(|| bnauth_core::ManualMaterial::from_key(&self.secret));
+        self.invalid_secret = key.is_err();
+        let serial = serial?;
+        restore?;
+        let material = key?.with_fields(serial, &self.restore)?;
+        self.preview = Some(
+            bnauth_core::prepare_import(vault, &self.name, &self.description, group, material)?
+                .preview,
+        );
         self.error.clear();
         Ok(())
     }
@@ -605,14 +749,5 @@ mod tests {
         assert_fits(fitted, work, decoration);
         assert!(work_area_in_points([0, 0, 1920, 1080], 0.0).is_none());
         assert!(work_area_in_points([10, 0, 0, 1080], 1.0).is_none());
-    }
-
-    #[test]
-    fn small_fractional_work_area_can_lower_normal_minimum_without_hiding_chrome() {
-        let work = work_area_in_points([-1919, 37, -1520, 480], 1.5).unwrap();
-        let decoration = Vec2::new(10.0, 26.0);
-        let fitted = fixed_launch_geometry(work, decoration).unwrap();
-        assert!(fitted.width < 320 && fitted.height < 420);
-        assert_fits(fitted, work, decoration);
     }
 }

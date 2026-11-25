@@ -39,9 +39,6 @@ impl bnauth_app::Repository for ClockRepository {
             warning: None,
         })
     }
-    fn restore(&mut self, candidate: &VaultSnapshot) -> Result<bnauth_app::CommitOutcome, String> {
-        self.commit(candidate)
-    }
     fn retry_cleanup(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -53,7 +50,7 @@ fn sample(offset: i64) -> SyncSample {
 }
 fn ready(released: bool, failures: usize) -> (GroupUi, ReleaseOnDrop) {
     let mut ui = GroupUi::new();
-    let vault = VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+    let vault = VaultSnapshot::new_empty();
     ui.use_memory_vault(vault.clone());
     ui.app.dialog = None;
     let control = Arc::new(Control {
@@ -84,133 +81,141 @@ fn receive_with_origin(ui: &mut GroupUi, sample: SyncSample, manual: bool) {
 }
 
 #[test]
-fn a_new_automatic_sample_during_a_manual_calibration_save_keeps_the_manual_feedback() {
+fn manual_calibration_joins_an_active_automatic_request_and_saves_once() {
     let (mut ui, control) = ready(false, 0);
-    let original = ui.app.runtime.app.current.clone().unwrap();
-    let first = sample(-1234);
-    let first_record = first.record.clone();
-    // A manual click joins an automatic request already in flight. It must
-    // share that request and still provide the manual completion feedback.
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
+    let result = sample(-1234);
+    let record = result.record.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
     ui.app.runtime.sync_rx = Some(receiver);
     ui.app.runtime.sync_manual = false;
     ui.app.begin_time_sync();
-    sender.send(Ok(first)).unwrap();
+    assert!(ui.app.runtime.sync_manual);
+    assert_eq!(ui.app.runtime.sync_requests, 0);
+    sender.send(Ok(result)).unwrap();
     ui.app.poll_runtime(&ui.ctx);
     assert!(ui.app.runtime.app.saving);
-    assert_eq!(
-        ui.app.runtime.clock_save_inflight.as_ref(),
-        Some(&first_record)
-    );
-    let second = sample(500);
-    let second_record = second.record.clone();
-    receive_with_origin(&mut ui, second, false);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-    assert_eq!(
-        ui.app.runtime.pending_clock_record.as_ref(),
-        Some(&second_record)
-    );
+    assert_eq!(ui.app.runtime.clock_save_inflight.as_ref(), Some(&record));
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+    assert!(ui.app.notifications.visible(Instant::now()).is_none());
+
     control.0.released.store(true, Ordering::Release);
     wait_runtime(&mut ui);
     let runtime = &ui.app.runtime;
-    let current = runtime.app.current.as_ref().unwrap();
-    assert_eq!(current.revision, original.revision + 2);
-    assert_eq!(
-        current.service_time_sync.battlenet.as_ref(),
-        Some(&second_record)
-    );
-    assert_eq!(runtime.clock.last_success(), Some(&second_record));
+    let current = runtime.app.current.as_deref().unwrap();
+    assert_eq!(current.revision, original.revision + 1);
+    assert_eq!(current.service_time_sync.battlenet.as_ref(), Some(&record));
+    assert_eq!(runtime.clock.last_success(), Some(&record));
     assert!(runtime.pending_clock_record.is_none() && runtime.clock_save_inflight.is_none());
     let candidates = control.0.candidates.lock().unwrap();
-    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates.len(), 1);
     assert_eq!(
         candidates[0].service_time_sync.battlenet.as_ref(),
-        Some(&first_record)
+        Some(&record)
     );
-    assert_eq!(
-        candidates[1].service_time_sync.battlenet.as_ref(),
-        Some(&second_record)
-    );
-    assert_eq!(candidates[1].revision, original.revision + 1);
     assert_eq!(current.groups, original.groups);
-    drop(candidates);
     assert_eq!(ui.app.notifications.pending_warning_count(), 0);
     assert_eq!(
         ui.app.notifications.visible(Instant::now()),
-        Some("校時成功並已保存")
+        Some("校時成功")
     );
 }
 
 #[test]
 fn a_failed_clock_save_keeps_the_sample_and_retry_saves_it_without_another_network_round() {
-    let (mut ui, control) = ready(true, 1);
-    let original = ui.app.runtime.app.current.clone().unwrap();
-    let fresh = sample(2345);
-    let record = fresh.record.clone();
-    receive(&mut ui, fresh);
-    wait_runtime(&mut ui);
-    assert!(ui.app.runtime.app.has_pending());
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-    assert_eq!(ui.app.runtime.pending_clock_record.as_ref(), Some(&record));
-    assert_eq!(ui.app.runtime.clock_save_inflight.as_ref(), Some(&record));
-    assert!(ui.app.runtime.clock.is_synced() && ui.app.runtime.sync_rx.is_none());
-    ui.app.runtime.app.retry().unwrap();
-    wait_runtime(&mut ui);
-    let runtime = &ui.app.runtime;
-    assert_eq!(
-        runtime
-            .app
-            .current
-            .as_ref()
-            .unwrap()
-            .service_time_sync
-            .battlenet
-            .as_ref(),
-        Some(&record)
-    );
-    assert!(runtime.pending_clock_record.is_none() && runtime.clock_save_inflight.is_none());
-    assert!(!runtime.app.has_pending() && runtime.sync_rx.is_none());
-    assert_eq!(control.0.candidates.lock().unwrap().len(), 2);
+    for (clock_jump, new_result) in [(false, false), (true, false), (true, true)] {
+        let (mut ui, control) = ready(true, 1);
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
+        let fresh = sample(2345);
+        let first = fresh.record.clone();
+        receive(&mut ui, fresh);
+        wait_runtime(&mut ui);
+        assert!(ui.app.runtime.app.has_pending());
+        assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+        assert_eq!(ui.app.runtime.clock_save_inflight.as_ref(), Some(&first));
+
+        if clock_jump {
+            let reading = ClockObservation::at(bnauth_core::now_ms() + 3_600_000, Instant::now());
+            ui.app.poll_runtime_with_clock(&ui.ctx, || reading);
+            assert_eq!(ui.app.runtime.pending_clock_record.as_ref(), Some(&first));
+        }
+        let expected = if new_result {
+            let fresh = sample(900);
+            let record = fresh.record.clone();
+            receive(&mut ui, fresh);
+            record
+        } else {
+            first.clone()
+        };
+
+        ui.view = TestView::Saving;
+        ui.frame(Vec::new());
+        ui.click(ui.point("重試"));
+        wait_runtime(&mut ui);
+        let runtime = &ui.app.runtime;
+        let current = runtime.app.current.as_deref().unwrap();
+        assert_eq!(current.revision, original.revision + 1);
+        assert_eq!(
+            current.service_time_sync.battlenet.as_ref(),
+            Some(&expected)
+        );
+        assert!(runtime.pending_clock_record.is_none() && runtime.clock_save_inflight.is_none());
+        assert!(!runtime.app.has_pending() && runtime.sync_rx.is_none());
+        assert_eq!(runtime.sync_requests, 0);
+        let candidates = control.0.candidates.lock().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].service_time_sync.battlenet.as_ref(),
+            Some(&first)
+        );
+        assert_eq!(
+            candidates[1].service_time_sync.battlenet.as_ref(),
+            Some(&expected)
+        );
+    }
 }
 
 #[test]
 fn discarding_a_failed_clock_write_restores_the_saved_clock_and_does_not_requeue_it() {
-    let (mut ui, control) = ready(true, 1);
-    let old = sample(-100).record;
-    let mut original = ui.app.runtime.app.current.clone().unwrap();
-    original.service_time_sync.battlenet = Some(old.clone());
-    // Reopen a saved snapshot through the actual Loaded event.
-    let worker = control.0.clone();
-    let loaded = original.clone();
-    ui.app.runtime.app = bnauth_app::Application::start(Box::new(move || {
-        Ok((
-            Box::new(ClockRepository(worker.clone())),
-            Some(loaded.clone()),
-        ))
-    }));
-    wait_runtime(&mut ui);
-    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(-100));
+    let (mut ui, control, original, old) = with_saved_clock(true);
+    let token = ui.app.model.change_token();
+    control.0.failures.store(1, Ordering::SeqCst);
     receive(&mut ui, sample(800));
     wait_runtime(&mut ui);
     assert!(ui.app.runtime.app.has_pending());
     assert_eq!(ui.app.runtime.clock.offset_ms(), Some(800));
-    ui.app.discard_unsaved_changes();
+    ui.view = TestView::Saving;
+    ui.frame(Vec::new());
+    let time = IMPORT_TEST_TIME;
+    let code = ui.app.otp_cache.code(&ui.app.model.entries[0].record, time);
+    let calculations = ui.app.otp_cache.calculations;
+    ui.click(ui.point("放棄"));
     ui.app.poll_runtime(&ui.ctx);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+    assert_eq!(ui.app.model.change_token(), token);
     assert_eq!(ui.app.runtime.clock.last_success(), Some(&old));
-    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(-100));
+    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(old.offset_ms));
     assert!(
         ui.app.runtime.pending_clock_record.is_none()
             && ui.app.runtime.clock_save_inflight.is_none()
     );
     assert!(!ui.app.runtime.app.has_pending() && !ui.app.runtime.app.saving);
     assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
+    let entry = &ui.app.model.entries[0].record;
+    assert_eq!(ui.app.otp_cache.code(entry, time), code);
+    assert_eq!(ui.app.otp_cache.calculations, calculations);
+    let next_step = time + 30_000;
+    assert_eq!(
+        ui.app.otp_cache.code(entry, next_step),
+        bnauth_core::totp(&entry.secret, next_step).unwrap()
+    );
+    assert_eq!(ui.app.otp_cache.calculations, calculations + 1);
 }
 
 #[test]
 fn discarding_failed_user_data_keeps_the_independent_successful_calibration_for_saving() {
     let (mut ui, control) = ready(false, 1);
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let mut data = original.clone();
     data.groups.push(bnauth_core::Group {
         id: uuid::Uuid::new_v4(),
@@ -227,7 +232,7 @@ fn discarding_failed_user_data_keeps_the_independent_successful_calibration_for_
     assert!(ui.app.runtime.app.has_pending() && ui.app.runtime.clock_save_inflight.is_none());
     ui.app.discard_unsaved_changes();
     wait_runtime(&mut ui);
-    let current = ui.app.runtime.app.current.as_ref().unwrap();
+    let current = ui.app.runtime.app.current.as_deref().unwrap();
     assert_eq!(current.groups, original.groups);
     assert_eq!(current.authenticators, original.authenticators);
     assert_eq!(current.service_time_sync.battlenet.as_ref(), Some(&record));
@@ -236,82 +241,133 @@ fn discarding_failed_user_data_keeps_the_independent_successful_calibration_for_
 }
 
 #[test]
-fn reloading_installs_the_saved_offset_and_clears_old_pending_clock_results() {
-    let (mut ui, control) = ready(true, 0);
-    let saved_record = sample(-321).record;
-    let mut saved = ui.app.runtime.app.current.clone().unwrap();
-    saved.service_time_sync.battlenet = Some(saved_record.clone());
-    let worker = control.0.clone();
-    ui.app.runtime.app = bnauth_app::Application::start(Box::new(move || {
-        Ok((
-            Box::new(ClockRepository(worker.clone())),
-            Some(saved.clone()),
-        ))
-    }));
-    ui.app.runtime.pending_clock_record = Some(sample(999).record);
-    ui.app.runtime.clock_save_inflight = None;
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    ui.app.runtime.sync_rx = Some(receiver);
-    wait_runtime(&mut ui);
-    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(-321));
-    assert!(ui.app.runtime.clock.is_from_saved());
-    assert_eq!(ui.app.runtime.clock.last_success(), Some(&saved_record));
-    assert!(
-        ui.app.runtime.pending_clock_record.is_none()
-            && ui.app.runtime.clock_save_inflight.is_none()
-    );
-    assert!(ui.app.runtime.sync_rx.is_none());
-    assert!(control.0.candidates.lock().unwrap().is_empty());
+fn retry_or_discard_after_a_manual_import_and_clock_save_fails() {
+    for (discard, clock_jump) in [(false, false), (true, false), (false, true)] {
+        let (mut ui, control) = ready(true, 1);
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
+        ui.open(Dialog::Import(Box::new(import_draft())));
+        ui.click(ui.point("預覽匯入"));
+
+        let fresh = sample(150);
+        let record = fresh.record.clone();
+        receive(&mut ui, fresh);
+        assert!(control.0.candidates.lock().unwrap().is_empty());
+
+        ui.click(ui.point("確認"));
+        wait_runtime(&mut ui);
+        assert!(ui.app.runtime.app.has_pending());
+        assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+        assert!(ui.app.model.entries.is_empty());
+
+        if clock_jump {
+            let reading = ClockObservation::at(bnauth_core::now_ms() + 3_600_000, Instant::now());
+            ui.app.poll_runtime_with_clock(&ui.ctx, || reading);
+            assert_eq!(ui.app.runtime.clock.last_success(), Some(&record));
+        }
+        ui.view = TestView::Saving;
+        ui.frame(Vec::new());
+        let button = if discard { "放棄" } else { "重試" };
+        ui.click(ui.point(button));
+        wait_runtime(&mut ui);
+
+        let expected_count = usize::from(!discard);
+        let current = ui.app.runtime.app.current.as_deref().unwrap();
+        assert_eq!(current.revision, original.revision + 1);
+        assert_eq!(current.authenticators.len(), expected_count);
+        assert_eq!(ui.app.model.entries.len(), expected_count);
+        assert_eq!(current.service_time_sync.battlenet.as_ref(), Some(&record));
+        assert_eq!(ui.app.runtime.sync_requests, 0);
+        let candidates = control.0.candidates.lock().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].authenticators.len(), 1);
+        assert_eq!(
+            candidates[0].service_time_sync.battlenet.as_ref(),
+            Some(&record)
+        );
+        assert_eq!(candidates[1].authenticators.len(), expected_count);
+        assert_eq!(
+            candidates[1].service_time_sync.battlenet.as_ref(),
+            Some(&record)
+        );
+    }
 }
 
 #[test]
-fn full_restore_installs_source_saved_clock_and_drops_pre_restore_deferred_samples() {
-    let (mut ui, control) = ready(true, 0);
-    let record: TimeSyncRecord = sample(4321).record;
-    let mut source = VaultSnapshot::new_empty(IMPORT_TEST_TIME);
-    source.service_time_sync.battlenet = Some(record.clone());
-    let preview = bnauth_core::prepare_full_restore(
-        ui.app.runtime.app.current.as_ref(),
-        &source,
-        IMPORT_TEST_TIME + 1,
-    )
-    .unwrap();
-    ui.app.runtime.pending_clock_record = Some(sample(-888).record);
-    ui.app
-        .runtime
-        .app
-        .restore(preview.candidate, false)
-        .unwrap();
-    ui.app.runtime.pending_full_restore = true;
+fn retry_saves_a_recovered_authenticator_with_a_late_clock_result() {
+    let (mut ui, control) = ready(true, 1);
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
+    let (reply, receiver) = std::sync::mpsc::channel();
+    ui.app.runtime.sync_rx = Some(receiver);
+    ui.app.runtime.sync_manual = true;
+
+    ui.open(Dialog::Import(Box::new(import_draft())));
+    ui.click(ui.point("預覽匯入"));
+    assert!(control.0.candidates.lock().unwrap().is_empty());
+    ui.click(ui.point("確認"));
     wait_runtime(&mut ui);
-    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(4321));
-    assert!(ui.app.runtime.clock.is_from_saved());
+    assert!(ui.app.runtime.app.has_pending());
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+
+    let fresh = sample(150);
+    let record = fresh.record.clone();
+    reply.send(Ok(fresh)).unwrap();
+    ui.app.poll_runtime(&ui.ctx);
+    assert_eq!(ui.app.runtime.pending_clock_record.as_ref(), Some(&record));
+    assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
+
+    ui.view = TestView::Saving;
+    ui.frame(Vec::new());
+    ui.click(ui.point("重試"));
+    wait_runtime(&mut ui);
+
+    let current = ui.app.runtime.app.current.as_deref().unwrap();
+    let candidates = control.0.candidates.lock().unwrap();
+    assert_eq!(current.revision, original.revision + 1);
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates[0].service_time_sync.battlenet.is_none());
     assert_eq!(
-        ui.app
-            .runtime
-            .app
-            .current
-            .as_ref()
-            .unwrap()
-            .service_time_sync
-            .battlenet
-            .as_ref(),
+        candidates[1].service_time_sync.battlenet.as_ref(),
         Some(&record)
     );
-    assert!(
-        ui.app.runtime.pending_clock_record.is_none()
-            && ui.app.runtime.clock_save_inflight.is_none()
-    );
-    assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
+    assert_eq!(current.service_time_sync.battlenet.as_ref(), Some(&record));
+    assert_eq!(current.authenticators.len(), 1);
+    assert_eq!(current.authenticators, candidates[0].authenticators);
+    assert_eq!(ui.app.model.entries.len(), 1);
+    assert!(ui.app.runtime.pending_clock_record.is_none());
+    assert_eq!(ui.app.runtime.sync_requests, 0);
 }
 
 #[test]
 fn a_failed_explicit_reload_cancels_clock_work_and_late_replies_cannot_block_closing() {
-    for (reply_before_reload, pending_invalidation) in
-        [(false, false), (true, false), (false, true)]
-    {
+    use super::lifecycle_ui_tests::{click_visible, interactive_frame};
+
+    struct UnverifiedClockRepository {
+        inner: ClockRepository,
+        blocked: bool,
+    }
+
+    impl bnauth_app::Repository for UnverifiedClockRepository {
+        fn state(&self) -> bnauth_app::RepositoryState {
+            bnauth_app::RepositoryState {
+                blocked: self.blocked,
+                ..Default::default()
+            }
+        }
+
+        fn commit(&mut self, candidate: &VaultSnapshot) -> Result<bnauth_app::CommitOutcome, String> {
+            let result = self.inner.commit(candidate);
+            self.blocked = result.is_err();
+            result
+        }
+
+        fn retry_cleanup(&mut self) -> Result<(), String> {
+            self.inner.retry_cleanup()
+        }
+    }
+
+    for reply_before_reload in [false, true] {
         let (mut ui, control) = ready(true, 1);
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let opens = Arc::new(AtomicUsize::new(0));
         let worker_opens = opens.clone();
         let worker = control.0.clone();
@@ -321,7 +377,10 @@ fn a_failed_explicit_reload_cancels_clock_work_and_late_replies_cannot_block_clo
                 return Err("人工重新讀取失敗".into());
             }
             Ok((
-                Box::new(ClockRepository(worker.clone())),
+                Box::new(UnverifiedClockRepository {
+                    inner: ClockRepository(worker.clone()),
+                    blocked: false,
+                }),
                 Some(worker_vault.clone()),
             ))
         }));
@@ -348,17 +407,14 @@ fn a_failed_explicit_reload_cancels_clock_work_and_late_replies_cannot_block_clo
             ui.app.poll_runtime(&ui.ctx);
             assert!(ui.app.runtime.pending_clock_record.is_some());
         }
-        if pending_invalidation {
-            ui.app.runtime.invalidated_clock_records = vec![sample(-500).record];
-            ui.app.runtime.pending_clock_record = None;
-            ui.app.runtime.pending_clock_invalidation = true;
-            ui.app.runtime.clock = bnauth_core::clock::RuntimeClock::new();
-            assert!(ui.app.runtime.close_blocked());
-        }
-
-        ui.view = TestView::Saving;
-        ui.frame(Vec::new());
-        ui.click(ui.point("放棄變更並重新讀取資料檔"));
+        interactive_frame(&mut ui, Vec::new());
+        let discard = ui.point("放棄");
+        click_visible(&mut ui, discard);
+        assert!(!ui.app.runtime.app.has_pending());
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert!(!ui.points("根據名稱查找").is_empty());
+        let reload = ui.point("重新讀取");
+        click_visible(&mut ui, reload);
         wait_runtime(&mut ui);
         assert_eq!(opens.load(Ordering::SeqCst), 2);
         assert_eq!(ui.app.runtime.app.phase, bnauth_app::Phase::Error);
@@ -366,14 +422,12 @@ fn a_failed_explicit_reload_cancels_clock_work_and_late_replies_cannot_block_clo
             ui.app.runtime.app.error.as_deref(),
             Some("人工重新讀取失敗")
         );
-        assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
+        assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
         assert!(!ui.app.runtime.app.has_pending());
-        assert!(!ui.app.runtime.app.repository_state.needs_attention());
+        assert!(ui.app.runtime.app.repository_state.blocked);
         assert!(ui.app.runtime.sync_rx.is_none());
         assert!(ui.app.runtime.pending_clock_record.is_none());
         assert!(ui.app.runtime.clock_save_inflight.is_none());
-        assert!(!ui.app.runtime.pending_clock_invalidation);
-        assert!(!ui.app.runtime.clock_invalidation_inflight);
         assert!(
             !ui.app.runtime.sync_manual
                 && !ui.app.runtime.pending_clock_manual
@@ -393,11 +447,21 @@ fn a_failed_explicit_reload_cancels_clock_work_and_late_replies_cannot_block_clo
 fn with_saved_clock(released: bool) -> (GroupUi, ReleaseOnDrop, VaultSnapshot, TimeSyncRecord) {
     let (mut ui, control) = ready(released, 0);
     let old_record = sample(-350).record;
-    let mut saved = ui.app.runtime.app.current.clone().unwrap();
+    let mut saved = ui.app.runtime.app.current.as_deref().unwrap().clone();
+    saved = bnauth_core::prepare_import(
+        &saved,
+        "原有驗證器",
+        "",
+        saved.groups[0].id,
+        bnauth_core::parse_manual("3132333435363738393031323334353637383930", "", "").unwrap(),
+    )
+    .unwrap()
+    .candidate(&saved)
+    .unwrap();
     saved.service_time_sync.battlenet = Some(old_record.clone());
     saved.groups.push(bnauth_core::Group {
         id: uuid::Uuid::new_v4(),
-        name: "校時清理須保留的分組".into(),
+        name: "原有分組".into(),
         sort_order: 1,
         is_ungrouped: false,
     });
@@ -415,729 +479,290 @@ fn with_saved_clock(released: bool) -> (GroupUi, ReleaseOnDrop, VaultSnapshot, T
 }
 
 #[test]
-fn an_invalid_saved_clock_is_atomically_cleared_and_cannot_reactivate_after_reload() {
-    let (mut ui, control, original, old_record) = with_saved_clock(true);
-    // Core clock tests exercise actual wall jumps. Simulate its consumed signal
-    // and invalid-record marker here to verify the UI's persistence transaction.
-    ui.app.runtime.invalidated_clock_records = vec![old_record.clone()];
-    ui.app.runtime.pending_clock_invalidation = true;
-    ui.app.runtime.clock = bnauth_core::clock::RuntimeClock::new();
-    ui.app.load_shared_clock();
-    assert!(ui.app.runtime.pending_clock_invalidation);
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-    ui.app.poll_runtime(&ui.ctx);
-    assert!(ui.app.runtime.app.saving);
-    assert!(ui.app.runtime.clock_invalidation_inflight);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-    wait_runtime(&mut ui);
+fn clock_ack_keeps_the_projection_and_cache_while_rebasing_later_edits() {
+    let (mut ui, control, original, _) = with_saved_clock(true);
+    let entry_id = ui.app.model.entries[0].id;
+    let token = ui.app.model.change_token();
+    let time = IMPORT_TEST_TIME;
+    let code = ui.app.otp_cache.code(&ui.app.model.entries[0].record, time);
+    let calculations = ui.app.otp_cache.calculations;
 
-    let cleared = ui.app.runtime.app.current.as_ref().unwrap();
-    assert!(cleared.service_time_sync.battlenet.is_none());
-    assert_eq!(cleared.revision, original.revision + 1);
-    assert_eq!(cleared.groups, original.groups);
-    assert_eq!(cleared.authenticators, original.authenticators);
-    assert!(ui.app.runtime.pending_clock_record.is_none());
-    assert!(!ui.app.runtime.pending_clock_invalidation);
-    assert!(!ui.app.runtime.clock_invalidation_inflight);
-    assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
-    assert!(
-        control.0.candidates.lock().unwrap()[0]
-            .service_time_sync
-            .battlenet
-            .is_none()
-    );
-    ui.app.load_shared_clock();
-    ui.app.poll_runtime(&ui.ctx);
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-    assert!(!ui.app.runtime.clock.is_synced());
-    assert!(!ui.app.runtime.pending_clock_invalidation);
-    assert!(!ui.app.runtime.close_blocked());
-    assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
-}
-
-#[test]
-fn a_new_calibration_during_an_invalidation_write_survives_the_clear_acknowledgement() {
-    let (mut ui, control, original, old_record) = with_saved_clock(false);
-    ui.app.runtime.invalidated_clock_records = vec![old_record.clone()];
-    ui.app.runtime.pending_clock_invalidation = true;
-    ui.app.runtime.clock = bnauth_core::clock::RuntimeClock::new();
-    ui.app.poll_runtime(&ui.ctx);
-    assert!(ui.app.runtime.app.saving);
-    assert!(ui.app.runtime.clock_invalidation_inflight);
-    let fresh = sample(825);
-    let fresh_record = fresh.record.clone();
+    let fresh = sample(350);
+    let record = fresh.record.clone();
     receive(&mut ui, fresh);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-    assert_eq!(
-        ui.app.runtime.pending_clock_record.as_ref(),
-        Some(&fresh_record)
-    );
-    assert!(!ui.app.runtime.pending_clock_invalidation);
-    assert!(
-        ui.app
-            .runtime
-            .invalidated_clock_records
-            .contains(&old_record)
-    );
-    assert!(ui.app.runtime.clock_invalidation_inflight);
-    control.0.released.store(true, Ordering::Release);
     wait_runtime(&mut ui);
-
-    let current = ui.app.runtime.app.current.as_ref().unwrap();
+    let saved = ui.app.runtime.app.current.as_deref().unwrap();
+    assert_eq!(saved.revision, original.revision + 1);
+    assert_eq!(saved.service_time_sync.battlenet.as_ref(), Some(&record));
+    assert!(std::ptr::eq(&*saved.groups, &*original.groups));
+    assert!(std::ptr::eq(
+        &*saved.authenticators,
+        &*original.authenticators
+    ));
+    assert_eq!(&ui.app.model.snapshot(), saved);
+    assert_eq!(ui.app.model.change_token(), token);
     assert_eq!(
-        current.service_time_sync.battlenet.as_ref(),
-        Some(&fresh_record)
+        ui.app.otp_cache.code(&ui.app.model.entries[0].record, time),
+        code
     );
-    assert_eq!(current.revision, original.revision + 2);
-    assert_eq!(current.groups, original.groups);
-    assert_eq!(current.authenticators, original.authenticators);
-    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(825));
-    assert!(ui.app.runtime.pending_clock_record.is_none());
-    assert!(!ui.app.runtime.pending_clock_invalidation);
-    assert!(!ui.app.runtime.clock_invalidation_inflight);
+    assert_eq!(ui.app.otp_cache.calculations, calculations);
+
+    ui.app.edit(&ui.ctx, Some(entry_id));
+    let latest = sample(800);
+    let latest_record = latest.record.clone();
+    receive(&mut ui, latest);
+    assert!(!ui.app.runtime.app.saving);
+    assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
+
+    let Some(Dialog::Edit { name, .. }) = ui.app.dialog.as_mut() else {
+        unreachable!()
+    };
+    *name = "修改名稱".into();
+    for _ in 0..3 {
+        ui.frame(Vec::new());
+    }
+    ui.click(ui.point("套用"));
+    assert_eq!(ui.app.model.change_token(), token);
+    wait_runtime(&mut ui);
     let candidates = control.0.candidates.lock().unwrap();
     assert_eq!(candidates.len(), 2);
-    assert!(candidates[0].service_time_sync.battlenet.is_none());
+    assert_eq!(candidates[1].revision, original.revision + 1);
     assert_eq!(
         candidates[1].service_time_sync.battlenet.as_ref(),
-        Some(&fresh_record)
+        Some(&latest_record)
     );
-    drop(candidates);
-    ui.app.load_shared_clock();
-    ui.app.poll_runtime(&ui.ctx);
-    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(825));
-    assert!(ui.app.runtime.clock.is_synced());
-    assert!(!ui.app.runtime.pending_clock_invalidation);
-    assert_eq!(control.0.candidates.lock().unwrap().len(), 2);
-}
-
-fn invalidate_shared_clock(ui: &mut GroupUi) {
-    // Core tests inject actual wall-clock jumps and verify take_invalidation.
-    // Consume the same runtime transition without changing the machine clock.
-    ui.app.runtime.note_clock_invalidation(false);
-    ui.app.runtime.clock = bnauth_core::clock::RuntimeClock::new();
+    let saved = ui.app.runtime.app.current.as_deref().unwrap();
+    assert_eq!(saved.revision, original.revision + 2);
+    assert_eq!(
+        saved.service_time_sync.battlenet.as_ref(),
+        Some(&latest_record)
+    );
+    assert!(ui.app.runtime.pending_clock_record.is_none());
+    assert_eq!(ui.app.runtime.sync_requests, 0);
+    let saved_entry = &saved.authenticators[0];
+    assert_eq!(saved_entry.name, "修改名稱");
+    let live_entry = &ui.app.model.entries[0].record;
+    assert_eq!(live_entry, saved_entry);
+    assert_eq!(ui.app.otp_cache.code(live_entry, time), code);
+    assert_eq!(&ui.app.model.snapshot(), saved);
+    assert_eq!(ui.app.model.change_token(), token + 1);
+    assert_eq!(ui.app.otp_cache.calculations, calculations);
 }
 
 #[test]
-fn a_failed_new_sample_cannot_forget_a_known_invalid_saved_clock_on_discard() {
+fn a_system_time_change_keeps_the_saved_offset_and_does_not_start_a_save_or_sync() {
     let (mut ui, control, original, saved) = with_saved_clock(true);
-    ui.app.dialog = Some(Dialog::Info);
-    invalidate_shared_clock(&mut ui);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    let fresh = sample(750);
-    let fresh_record = fresh.record.clone();
-    receive(&mut ui, fresh);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(750));
-    assert!(
-        !ui.app.runtime.app.saving,
-        "the modal defers metadata persistence"
-    );
-    control.0.failures.store(1, Ordering::SeqCst);
-    ui.app.dialog = None;
-    ui.app.poll_runtime(&ui.ctx);
-    wait_runtime(&mut ui);
-    assert!(ui.app.runtime.app.has_pending());
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-    ui.view = TestView::Saving;
-    ui.frame(Vec::new());
-    ui.click(ui.point("放棄這次未保存變更"));
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-    assert!(ui.app.runtime.pending_clock_invalidation);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    ui.app.poll_runtime(&ui.ctx);
-    wait_runtime(&mut ui);
-    let current = ui.app.runtime.app.current.as_ref().unwrap();
-    assert!(current.service_time_sync.battlenet.is_none());
-    assert_eq!(current.revision, original.revision + 1);
-    assert_eq!(current.groups, original.groups);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    let candidates = control.0.candidates.lock().unwrap();
-    assert_eq!(candidates.len(), 2);
-    assert_eq!(
-        candidates[0].service_time_sync.battlenet.as_ref(),
-        Some(&fresh_record)
-    );
-    assert!(candidates[1].service_time_sync.battlenet.is_none());
+    let now = Instant::now();
+    let wall = bnauth_core::now_ms();
+    for (elapsed, adjustment, expect_warning) in [
+        (0, 60_000, true),
+        (30_000, 60_000, false),
+        (30_001, 60_000, false),
+        (31_000, 0, true),
+        (61_000, 0, false),
+    ] {
+        let instant = now + Duration::from_millis(elapsed as u64);
+        let changed_wall = wall + elapsed + adjustment;
+        let reading = ClockObservation::at(changed_wall, instant);
+        ui.app.poll_runtime_with_clock(&ui.ctx, || reading);
+        assert_eq!(ui.app.runtime.frame_time, changed_wall + saved.offset_ms);
+        assert_eq!(ui.app.runtime.clock.last_success(), Some(&saved));
+        assert_eq!(
+            ui.app.notifications.visible(instant),
+            expect_warning.then_some("E13：時間偏差過大，請重新校時")
+        );
+    }
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+    assert!(ui.app.runtime.pending_clock_record.is_none());
+    assert_eq!(ui.app.runtime.sync_requests, 0);
+    assert!(control.0.candidates.lock().unwrap().is_empty());
+    assert!(!ui.app.runtime.close_blocked());
 }
 
 #[test]
-fn invalidating_an_unsaved_sample_protects_both_it_and_the_saved_predecessor_after_discard() {
-    let (mut ui, control, original, saved) = with_saved_clock(true);
-    control.0.failures.store(1, Ordering::SeqCst);
-    let fresh = sample(900);
-    let fresh_record = fresh.record.clone();
-    receive(&mut ui, fresh);
-    wait_runtime(&mut ui);
-    assert!(ui.app.runtime.app.has_pending());
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-    invalidate_shared_clock(&mut ui);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert!(
-        ui.app
-            .runtime
-            .invalidated_clock_records
-            .contains(&fresh_record)
-    );
-    ui.app.discard_unsaved_changes();
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-    assert!(ui.app.runtime.pending_clock_invalidation);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert!(
-        ui.app
-            .runtime
-            .invalidated_clock_records
-            .contains(&fresh_record)
-    );
-    ui.app.poll_runtime(&ui.ctx);
-    wait_runtime(&mut ui);
-    assert!(
-        ui.app
-            .runtime
-            .app
-            .current
-            .as_ref()
-            .unwrap()
-            .service_time_sync
-            .battlenet
-            .is_none()
-    );
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    ui.app.load_shared_clock();
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-}
-
-#[test]
-fn an_invalidated_inflight_sample_remains_invalid_after_its_storage_ack_and_reload() {
-    let (mut ui, control, original, saved) = with_saved_clock(false);
-    let fresh = sample(950);
-    let fresh_record = fresh.record.clone();
-    receive(&mut ui, fresh);
-    assert!(ui.app.runtime.app.saving);
-    invalidate_shared_clock(&mut ui);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert!(
-        ui.app
-            .runtime
-            .invalidated_clock_records
-            .contains(&fresh_record)
-    );
-    // Hold the automatic clear long enough to inspect the acknowledged but
-    // already-invalid calibration and the subsequent shared-clock reload.
-    ui.app.dialog = Some(Dialog::Info);
-    control.0.released.store(true, Ordering::Release);
-    wait_runtime(&mut ui);
-    let current = ui.app.runtime.app.current.as_ref().unwrap();
-    assert_eq!(
-        current.service_time_sync.battlenet.as_ref(),
-        Some(&fresh_record)
-    );
-    assert_eq!(current.revision, original.revision + 1);
-    assert!(
-        ui.app
-            .runtime
-            .invalidated_clock_records
-            .contains(&fresh_record)
-    );
-    assert!(ui.app.runtime.pending_clock_invalidation);
-    ui.app.load_shared_clock();
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-    assert!(ui.app.runtime.pending_clock_invalidation);
-    ui.app.dialog = None;
-    ui.app.poll_runtime(&ui.ctx);
-    wait_runtime(&mut ui);
-    assert!(
-        ui.app
-            .runtime
-            .app
-            .current
-            .as_ref()
-            .unwrap()
-            .service_time_sync
-            .battlenet
-            .is_none()
-    );
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-    let candidates = control.0.candidates.lock().unwrap();
-    assert_eq!(candidates.len(), 2);
-    assert_eq!(
-        candidates[0].service_time_sync.battlenet.as_ref(),
-        Some(&fresh_record)
-    );
-    assert!(candidates[1].service_time_sync.battlenet.is_none());
-}
-
-#[test]
-fn restoring_a_full_backup_cannot_reactivate_a_calibration_already_known_invalid() {
-    let (mut ui, control, _, saved) = with_saved_clock(true);
-    invalidate_shared_clock(&mut ui);
-    let mut source = VaultSnapshot::new_empty(IMPORT_TEST_TIME);
-    source.service_time_sync.battlenet = Some(saved.clone());
-    source.groups.push(bnauth_core::Group {
-        id: uuid::Uuid::new_v4(),
-        name: "來源完整分組".into(),
-        sort_order: 1,
-        is_ungrouped: false,
-    });
-    let preview = bnauth_core::prepare_full_restore(
-        ui.app.runtime.app.current.as_ref(),
-        &source,
-        IMPORT_TEST_TIME + 1,
-    )
-    .unwrap();
-    ui.app.dialog = Some(Dialog::Info);
-    ui.app
-        .runtime
-        .app
-        .restore(preview.candidate, false)
-        .unwrap();
-    ui.app.runtime.pending_full_restore = true;
-    wait_runtime(&mut ui);
-    assert_eq!(
-        ui.app.runtime.app.current.as_ref().unwrap().groups,
-        source.groups
-    );
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-    assert!(ui.app.runtime.pending_clock_invalidation);
-    ui.app.dialog = None;
-    ui.app.poll_runtime(&ui.ctx);
-    wait_runtime(&mut ui);
-    assert!(
-        ui.app
-            .runtime
-            .app
-            .current
-            .as_ref()
-            .unwrap()
-            .service_time_sync
-            .battlenet
-            .is_none()
-    );
-    assert_eq!(
-        ui.app.runtime.app.current.as_ref().unwrap().groups,
-        source.groups
-    );
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert_eq!(control.0.candidates.lock().unwrap().len(), 2);
-}
-
-#[test]
-fn discovering_old_invalidation_during_fresh_apply_preserves_fresh_candidate_but_protects_disk() {
-    let (mut ui, control, original, saved) = with_saved_clock(true);
-    ui.app.dialog = Some(Dialog::Info);
-    let fresh = sample(1_100);
-    let fresh_record = fresh.record.clone();
-    receive(&mut ui, fresh);
-    // Core's regression covers take_invalidation() becoming true inside apply.
-    // The runtime must invalidate predecessors without marking fresh as invalid.
-    ui.app.runtime.note_clock_invalidation(true);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert!(
-        !ui.app
-            .runtime
-            .invalidated_clock_records
-            .contains(&fresh_record)
-    );
-    assert_eq!(
-        ui.app.runtime.pending_clock_record.as_ref(),
-        Some(&fresh_record)
-    );
-    assert_eq!(ui.app.runtime.clock.offset_ms(), Some(1_100));
-    assert!(!ui.app.runtime.pending_clock_invalidation);
-    control.0.failures.store(1, Ordering::SeqCst);
-    ui.app.dialog = None;
-    ui.app.poll_runtime(&ui.ctx);
-    wait_runtime(&mut ui);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-    assert!(ui.app.runtime.app.has_pending());
-    ui.app.discard_unsaved_changes();
-    assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-    assert!(ui.app.runtime.pending_clock_invalidation);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    ui.app.poll_runtime(&ui.ctx);
-    wait_runtime(&mut ui);
-    assert!(
-        ui.app
-            .runtime
-            .app
-            .current
-            .as_ref()
-            .unwrap()
-            .service_time_sync
-            .battlenet
-            .is_none()
-    );
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert_eq!(control.0.candidates.lock().unwrap().len(), 2);
-}
-
-#[test]
-fn acknowledged_clear_or_new_calibration_does_not_let_old_backup_reactivate_invalid_result() {
-    for save_new_sample in [false, true] {
-        let (mut ui, control, _, invalid) = with_saved_clock(true);
-        invalidate_shared_clock(&mut ui);
-        if save_new_sample {
-            ui.app.dialog = Some(Dialog::Info);
-            receive(&mut ui, sample(1_250));
-            ui.app.dialog = None;
-        }
-        ui.app.poll_runtime(&ui.ctx);
-        wait_runtime(&mut ui);
-        let acknowledged = ui.app.runtime.app.current.as_ref().unwrap();
-        let acknowledged_revision = acknowledged.revision;
-        if save_new_sample {
-            assert_eq!(
-                acknowledged
-                    .service_time_sync
-                    .battlenet
-                    .as_ref()
-                    .unwrap()
-                    .offset_ms,
-                1_250
-            );
+fn full_restore_confirmation_replaces_only_invalid_source_calibration() {
+    for (invalid_backup, pending_calibration, reply_after_restore) in [
+        (false, false, None),
+        (true, false, None),
+        (true, true, None),
+        (true, false, Some(false)),
+        (true, false, Some(true)),
+    ] {
+        let (mut ui, control, original, saved) = with_saved_clock(reply_after_restore.is_none());
+        full_restore_ui_tests::keep_restore_offline(&mut ui);
+        let mut source = full_restore_ui_tests::source();
+        let server_time = bnauth_core::now_ms();
+        let old_wall = if invalid_backup {
+            // This backup was calibrated on a PC whose calendar was 100 years ahead.
+            server_time + 100 * 365 * 86_400_000_i64
         } else {
-            assert!(acknowledged.service_time_sync.battlenet.is_none());
-        }
-        assert!(ui.app.runtime.invalidated_clock_records.contains(&invalid));
-        assert!(!ui.app.runtime.close_blocked());
-        assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
-
-        let mut source = VaultSnapshot::new_empty(IMPORT_TEST_TIME);
-        for (index, name) in [" 原備份分組 ", "備份空分組"].into_iter().enumerate() {
-            source.groups.push(bnauth_core::Group {
-                id: uuid::Uuid::new_v4(),
-                name: name.into(),
-                sort_order: index as u32 + 1,
-                is_ungrouped: false,
-            });
-        }
-        source = bnauth_core::prepare_import(
-            &source,
-            " 原文標題 ",
-            " 原文備註\r\n第二行 ",
-            source.groups[1].id,
-            bnauth_core::parse_manual(
-                "3132333435363738393031323334353637383930",
-                "US-1234-5678-9012",
-                "AbCd123456",
-            )
-            .unwrap(),
-            IMPORT_TEST_TIME,
-        )
-        .unwrap()
-        .candidate;
-        source.authenticators[0].secret = None;
-        source.authenticators[0]
-            .legacy_metadata
-            .push(bnauth_core::LegacyMetadata {
-                source: "fixture".into(),
-                source_version: Some("0.2.0".into()),
-                field: "完整歷史".into(),
-                original_value: " 原始歷史\r\n文字 ".into(),
-                unit: None,
-            });
-        source.service_time_sync.battlenet = Some(invalid.clone());
+            server_time - 250
+        };
+        let at = Instant::now();
+        source.service_time_sync.battlenet = Some(
+            bnauth_core::clock::validate_sample(server_time, old_wall, old_wall, at, at)
+                .unwrap()
+                .record,
+        );
         let original_source = source.clone();
-        let preview = bnauth_core::prepare_full_restore(
-            ui.app.runtime.app.current.as_ref(),
-            &source,
-            IMPORT_TEST_TIME + 1,
-        )
-        .unwrap();
-        assert!(!preview.new_secret);
-        let mut expected = preview.candidate;
-        expected.service_time_sync.battlenet = None;
+        let mut expected = bnauth_core::prepare_full_restore(Some(&original), &source).unwrap();
         full_restore_ui_tests::load_preview(&mut ui, &source);
-        ui.click(ui.point("我確認以備份取代目前全部資料"));
-        ui.click(ui.point("確認還原並保存"));
+        ui.click(ui.point("我已知曉目前資料將被全部取代。"));
+        if invalid_backup {
+            let replacement = if pending_calibration {
+                let fresh = sample(750);
+                let record = fresh.record.clone();
+                receive(&mut ui, fresh);
+                assert_eq!(ui.app.runtime.pending_clock_record.as_ref(), Some(&record));
+                record
+            } else {
+                saved
+            };
+            expected.candidate.service_time_sync.battlenet = Some(replacement);
+        }
+        let manual_reply = reply_after_restore.map(|after_restore| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            ui.app.runtime.sync_rx = Some(receiver);
+            ui.app.runtime.sync_manual = true;
+            (sender, after_restore)
+        });
+        let now = Instant::now();
+        let assert_restore_notice = |ui: &mut GroupUi| {
+            let notice = ui.app.notifications.visible(now).unwrap();
+            assert_eq!(notice, "已還原完整資料庫");
+        };
+        ui.click(ui.point("還原"));
         assert!(ui.app.dialog.is_none());
-        assert!(ui.app.runtime.pending_full_restore);
+        assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+        let late_record = manual_reply.map(|(sender, after_restore)| {
+            if after_restore {
+                control.0.released.store(true, Ordering::Release);
+                wait_runtime(&mut ui);
+                assert!(!ui.app.runtime.pending_full_restore);
+                assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
+                assert_restore_notice(&mut ui);
+            }
+
+            let fresh = sample(900);
+            let record = fresh.record.clone();
+            sender
+                .send(Ok(fresh))
+                .expect("restore keeps the manual receiver");
+            ui.app.poll_runtime(&ui.ctx);
+            if !after_restore {
+                assert!(ui.app.runtime.app.saving && ui.app.runtime.pending_full_restore);
+                assert_eq!(ui.app.runtime.pending_clock_record.as_ref(), Some(&record));
+                control.0.released.store(true, Ordering::Release);
+            }
+            record
+        });
         wait_runtime(&mut ui);
-        let restored = ui.app.runtime.app.current.as_ref().unwrap();
+        assert_restore_notice(&mut ui);
+
+        let restored = ui.app.runtime.app.current.as_deref().unwrap();
+        let clock_save = u64::from(late_record.is_some());
+        let expected = expected.candidate;
+        assert_eq!(restored.revision, original.revision + 1 + clock_save);
         assert_eq!(restored.groups, source.groups);
         assert_eq!(restored.authenticators, source.authenticators);
-        assert!(restored.service_time_sync.battlenet.is_none());
-        assert_eq!(restored.revision, acknowledged_revision + 1);
+        let expected_clock = late_record
+            .as_ref()
+            .or(expected.service_time_sync.battlenet.as_ref());
         assert_eq!(
-            restored
-                .provenance
-                .last()
-                .unwrap()
-                .source_time_sync
-                .as_ref(),
-            Some(&invalid)
+            restored.service_time_sync.battlenet.as_ref(),
+            expected_clock
         );
-        assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-        assert!(!ui.app.runtime.pending_clock_invalidation);
-        assert!(ui.app.runtime.invalidated_clock_records.contains(&invalid));
+        assert!(!ui.app.runtime.close_blocked());
         assert_eq!(source, original_source);
-        let candidates = control.0.candidates.lock().unwrap();
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[1], expected);
-        drop(candidates);
-        ui.app.load_shared_clock();
+        assert_eq!(
+            ui.app.runtime.clock.offset_ms(),
+            expected_clock.map(|record| record.offset_ms)
+        );
+        assert_eq!(ui.app.runtime.sync_requests, 0);
         for _ in 0..3 {
             ui.app.poll_runtime(&ui.ctx);
         }
-        assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-        assert!(!ui.app.runtime.pending_clock_invalidation);
-        assert!(!ui.app.runtime.clock_invalidation_inflight);
-        assert!(!ui.app.runtime.close_blocked());
-        assert_eq!(
-            control.0.candidates.lock().unwrap().len(),
-            2,
-            "the old tombstone must not cause repeated metadata writes"
-        );
-        assert!(ui.app.runtime.invalidated_clock_records.contains(&invalid));
+        let candidates = control.0.candidates.lock().unwrap();
+        if let Some(record) = late_record {
+            let mut clock_candidate = expected.clone();
+            clock_candidate.revision += 1;
+            clock_candidate.service_time_sync.battlenet = Some(record);
+            assert_eq!(candidates.as_slice(), &[expected, clock_candidate]);
+        } else {
+            assert_eq!(candidates.as_slice(), &[expected]);
+        }
     }
 }
 
 #[test]
-fn full_restore_confirmation_observes_the_old_clock_and_only_clears_a_matching_invalid_source() {
-    for same_calibration in [false, true] {
+fn reload_and_full_restore_apply_their_saved_offset_after_a_system_time_change() {
+    for restore in [false, true] {
         let (mut ui, control, original, saved) = with_saved_clock(true);
-        let mut source = full_restore_ui_tests::source();
-        let source_record = if same_calibration {
-            saved.clone()
+        let mut source = original.clone();
+        let replacement = sample(925).record;
+        source.service_time_sync.battlenet = Some(replacement.clone());
+        source.groups[1].name = "來源組名與順序須完整保留".into();
+        if restore {
+            let preview = bnauth_core::prepare_full_restore(Some(&original), &source).unwrap();
+            ui.app
+                .runtime
+                .app
+                .restore_from_preview(|| preview.candidate)
+                .unwrap();
+            ui.app.runtime.pending_full_restore = true;
         } else {
-            let mut fresh = saved.clone();
-            fresh.server_time_ms += 1;
-            fresh.local_wall_ms_at_sample += 1;
-            assert_ne!(fresh, saved);
-            assert_eq!(fresh.offset_ms, saved.offset_ms);
-            fresh
-        };
-        source.service_time_sync.battlenet = Some(source_record.clone());
-        let original_source = source.clone();
-        let mut expected =
-            bnauth_core::prepare_full_restore(Some(&original), &source, IMPORT_TEST_TIME + 1)
-                .unwrap()
-                .candidate;
-        if same_calibration {
-            expected.service_time_sync.battlenet = None;
+            let loaded = Arc::new(Mutex::new(original.clone()));
+            let worker_loaded = loaded.clone();
+            let worker_control = control.0.clone();
+            ui.app.runtime.app = bnauth_app::Application::start(Box::new(move || {
+                Ok((
+                    Box::new(ClockRepository(worker_control.clone())),
+                    Some(worker_loaded.lock().unwrap().clone()),
+                ))
+            }));
+            wait_runtime(&mut ui);
+            *loaded.lock().unwrap() = source.clone();
+            ui.app.reload_with_clock_cancel().unwrap();
         }
-        full_restore_ui_tests::load_preview(&mut ui, &source);
-        ui.click(ui.point("我確認以備份取代目前全部資料"));
 
-        // No poll has observed this OS step. The actual confirmation handler
-        // must inspect the old clock/storage context before selecting the source.
+        let instant = Instant::now();
+        let corrected_wall = bnauth_core::now_ms();
         ui.app.runtime.clock = RuntimeClock::from_saved_observation(
             Some(&saved),
-            ClockObservation::at(bnauth_core::now_ms() + 3_600_000, Instant::now()),
+            ClockObservation::at(corrected_wall + 3_600_000, instant),
         )
         .unwrap();
-        assert!(ui.app.runtime.invalidated_clock_records.is_empty());
-        assert!(!ui.app.runtime.clock.take_invalidation());
-        ui.click(ui.point("確認還原並保存"));
-        assert!(ui.app.dialog.is_none());
-        assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-        assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-        wait_runtime(&mut ui);
-
-        let restored = ui.app.runtime.app.current.as_ref().unwrap();
-        assert_eq!(restored.revision, original.revision + 1);
-        assert_eq!(restored.groups, source.groups);
-        assert_eq!(restored.authenticators, source.authenticators);
-        assert_eq!(restored.provenance, expected.provenance);
+        let reading =
+            ClockObservation::at(corrected_wall + 1_000, instant + Duration::from_secs(1));
+        let cache_clears = ui.app.otp_cache.clears;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            ui.app.poll_runtime_with_clock(&ui.ctx, || reading);
+            if ui.app.runtime.app.phase == bnauth_app::Phase::Ready && !ui.app.runtime.app.saving {
+                break;
+            }
+            assert!(Instant::now() < deadline, "ACK did not arrive");
+            std::thread::yield_now();
+        }
+        assert_eq!(ui.app.otp_cache.clears, cache_clears + 1);
+        let runtime = &ui.app.runtime;
         assert_eq!(
-            restored
-                .provenance
-                .last()
-                .unwrap()
-                .source_time_sync
-                .as_ref(),
-            Some(&source_record)
+            runtime.app.current.as_deref().unwrap().groups,
+            source.groups
         );
-        assert_eq!(restored.service_time_sync, expected.service_time_sync);
-        assert!(!ui.app.runtime.pending_clock_invalidation);
-        assert!(!ui.app.runtime.clock_invalidation_inflight);
-        assert!(!ui.app.runtime.close_blocked());
-        assert_eq!(source, original_source);
-        let candidates = control.0.candidates.lock().unwrap();
-        assert_eq!(candidates.as_slice(), &[expected]);
-        drop(candidates);
-        if same_calibration {
-            assert_eq!(ui.app.runtime.clock.offset_ms(), None);
-        } else {
-            assert_eq!(
-                ui.app.runtime.clock.offset_ms(),
-                Some(source_record.offset_ms)
-            );
-            assert!(
-                !ui.app
-                    .runtime
-                    .invalidated_clock_records
-                    .contains(&source_record)
-            );
-        }
-        for _ in 0..3 {
-            ui.app.poll_runtime(&ui.ctx);
-        }
-        assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
+        assert_eq!(
+            runtime.app.current.as_deref().unwrap().authenticators,
+            source.authenticators
+        );
+        assert_eq!(runtime.clock.last_success(), Some(&replacement));
+        assert_eq!(
+            runtime.frame_time,
+            corrected_wall + 1_000 + replacement.offset_ms
+        );
+        assert_eq!(
+            control.0.candidates.lock().unwrap().len(),
+            usize::from(restore)
+        );
+        assert_eq!(runtime.sync_requests, 0);
     }
-}
-
-#[test]
-fn loaded_and_full_restore_acknowledgements_observe_the_previous_clock_before_replacing_it() {
-    for restore in [false, true] {
-        for same_calibration in [false, true] {
-            let (mut ui, control, original, saved) = with_saved_clock(true);
-            let mut source = original.clone();
-            let replacement = if same_calibration {
-                saved.clone()
-            } else {
-                sample(925).record
-            };
-            source.service_time_sync.battlenet = Some(replacement.clone());
-            source.groups[1].name = "來源組名與順序須完整保留".into();
-            ui.app.dialog = Some(Dialog::Info); // Inspect the ACK before a deferred clear.
-            if restore {
-                let preview = bnauth_core::prepare_full_restore(
-                    Some(&original),
-                    &source,
-                    IMPORT_TEST_TIME + 1,
-                )
-                .unwrap();
-                ui.app
-                    .runtime
-                    .app
-                    .restore(preview.candidate, false)
-                    .unwrap();
-                ui.app.runtime.pending_full_restore = true;
-            } else {
-                let loaded = Arc::new(Mutex::new(original.clone()));
-                let worker_loaded = loaded.clone();
-                let worker_control = control.0.clone();
-                ui.app.runtime.app = bnauth_app::Application::start(Box::new(move || {
-                    Ok((
-                        Box::new(ClockRepository(worker_control.clone())),
-                        Some(worker_loaded.lock().unwrap().clone()),
-                    ))
-                }));
-                wait_runtime(&mut ui);
-                *loaded.lock().unwrap() = source.clone();
-                ui.app.reload_with_clock_cancel().unwrap();
-            }
-
-            // The OS step happens after the last observation and before the
-            // asynchronous Loaded/restore ACK. This uses the actual core signal.
-            let instant = Instant::now();
-            let corrected_wall = bnauth_core::now_ms();
-            ui.app.runtime.clock = RuntimeClock::from_saved_observation(
-                Some(&saved),
-                ClockObservation::at(corrected_wall + 3_600_000, instant),
-            )
-            .unwrap();
-            assert!(!ui.app.runtime.clock.take_invalidation());
-            let reading =
-                ClockObservation::at(corrected_wall + 1_000, instant + Duration::from_secs(1));
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                // Re-establish the same unobserved-step precondition before
-                // every drain attempt. Whichever poll receives the real worker
-                // ACK must observe this race, without scheduler sleeps/barriers.
-                ui.app.runtime.clock = RuntimeClock::from_saved_observation(
-                    Some(&saved),
-                    ClockObservation::at(corrected_wall + 3_600_000, instant),
-                )
-                .unwrap();
-                ui.app.runtime.invalidated_clock_records.clear();
-                ui.app.runtime.pending_clock_invalidation = false;
-                ui.app.poll_runtime_with_clock(&ui.ctx, || reading);
-                if ui.app.runtime.app.phase == bnauth_app::Phase::Ready
-                    && !ui.app.runtime.app.saving
-                {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "ACK did not arrive");
-                std::thread::yield_now();
-            }
-            let runtime = &ui.app.runtime;
-            assert!(runtime.invalidated_clock_records.contains(&saved));
-            assert_eq!(runtime.app.current.as_ref().unwrap().groups, source.groups);
-            assert_eq!(
-                runtime.app.current.as_ref().unwrap().authenticators,
-                source.authenticators
-            );
-            assert_eq!(runtime.clock.is_synced(), !same_calibration);
-            assert_eq!(runtime.pending_clock_invalidation, same_calibration);
-            if same_calibration {
-                assert_eq!(runtime.frame_time, corrected_wall + 1_000);
-            } else {
-                assert!(!runtime.invalidated_clock_records.contains(&replacement));
-                assert_eq!(runtime.clock.last_success(), Some(&replacement));
-                assert_eq!(
-                    runtime.frame_time,
-                    corrected_wall + 1_000 + replacement.offset_ms
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn reload_rebases_at_the_old_context_observation_without_marking_the_new_source_invalid() {
-    let (mut ui, _control, original, saved) = with_saved_clock(true);
-    let instant = Instant::now();
-    let wall = bnauth_core::now_ms();
-    let start = ClockObservation::at(wall + 3_600_000, instant);
-    let end = ClockObservation::at(wall + 1_000, instant + Duration::from_secs(1));
-    ui.app.runtime.clock = RuntimeClock::from_saved_observation(Some(&saved), start).unwrap();
-    let context = ui.app.runtime.clock_storage_context();
-    let replacement = sample(625).record;
-    let mut acknowledged = original;
-    acknowledged.service_time_sync.battlenet = Some(replacement.clone());
-    // Exercise the reload seam after an ACK changed current. The full worker
-    // integration is covered above; this fixes the transition to one reading.
-    ui.app.runtime.app.current = Some(acknowledged);
-    ui.app.load_shared_clock_observed(end, &context);
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert!(
-        !ui.app
-            .runtime
-            .invalidated_clock_records
-            .contains(&replacement)
-    );
-    assert!(ui.app.runtime.clock.is_synced());
-    assert!(!ui.app.runtime.pending_clock_invalidation);
-    assert_eq!(ui.app.runtime.clock.observe(end), wall + 1_000 + 625);
-    let later_step = ClockObservation::at(wall + 10_000, instant + Duration::from_secs(2));
-    let context = ui.app.runtime.clock_storage_context();
-    ui.app.observe_shared_clock(later_step, &context);
-    assert!(
-        ui.app
-            .runtime
-            .invalidated_clock_records
-            .contains(&replacement)
-    );
-    assert!(!ui.app.runtime.clock.is_synced());
-}
-
-#[test]
-fn discarding_a_clock_write_observes_a_step_before_loading_the_saved_predecessor() {
-    let (mut ui, control, original, saved) = with_saved_clock(true);
-    control.0.failures.store(1, Ordering::SeqCst);
-    let fresh = sample(825);
-    let inflight = fresh.record.clone();
-    receive(&mut ui, fresh);
-    wait_runtime(&mut ui);
-    assert!(ui.app.runtime.app.has_pending());
-    // Only this clock instance's baseline is advanced; no OS/global clock is
-    // changed. The normal discard entry observes the real corrected time.
-    ui.app.runtime.clock = RuntimeClock::from_saved_observation(
-        Some(&inflight),
-        ClockObservation::at(bnauth_core::now_ms() + 3_600_000, Instant::now()),
-    )
-    .unwrap();
-    assert!(!ui.app.runtime.clock.take_invalidation());
-    ui.app.discard_unsaved_changes();
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&saved));
-    assert!(ui.app.runtime.invalidated_clock_records.contains(&inflight));
-    assert!(!ui.app.runtime.clock.is_synced());
-    assert!(ui.app.runtime.pending_clock_invalidation);
-    assert!(!ui.app.runtime.app.has_pending());
-    assert_eq!(control.0.candidates.lock().unwrap().len(), 1);
 }

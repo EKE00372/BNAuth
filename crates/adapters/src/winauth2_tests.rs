@@ -2,7 +2,7 @@ use super::*;
 use bnauth_core::{VaultSnapshot, parse_manual, prepare_import};
 
 fn record() -> Authenticator {
-    let vault = VaultSnapshot::new_empty(1_800_000_000_000);
+    let vault = VaultSnapshot::new_empty();
     prepare_import(
         &vault,
         " 繁體 & <title> \"' 😀 ",
@@ -14,12 +14,9 @@ fn record() -> Authenticator {
             "AbCd123456",
         )
         .unwrap(),
-        1_800_000_000_000,
     )
     .unwrap()
-    .candidate
-    .authenticators
-    .remove(0)
+    .record()
 }
 
 #[test]
@@ -49,43 +46,27 @@ fn exports_original_secretdata_and_separate_escaped_metadata_without_deriving_re
 }
 
 #[test]
-fn missing_serial_and_restore_code_stay_empty_with_a_local_clock_compatibility_offset() {
+fn local_clock_compatibility_preserves_missing_fields_and_measured_offsets() {
     let mut record = record();
     record.serial = None;
     record.restore_code = None;
-    record.restore_code_source = None;
-    let xml = encode(&record, None).unwrap();
-    assert!(xml.contains(
-        "<secretdata encrypted=\"\">3132333435363738393031323334353637383930</secretdata>"
-    ));
-    assert!(xml.contains("<servertimediff>1</servertimediff>"));
-    assert!(xml.contains("<bnauth:serial></bnauth:serial>"));
-    assert!(xml.contains("<bnauth:restoreCode></bnauth:restoreCode>"));
-}
-
-#[test]
-fn missing_and_exact_zero_offsets_never_request_winauth2_legacy_sync_but_measured_values_survive() {
-    for serial_present in [true, false] {
-        let mut record = record();
-        if !serial_present {
-            record.serial = None;
-            record.restore_code = None;
-            record.restore_code_source = None;
-        }
-        let original = record.clone();
-        for (offset, expected) in [
-            (None, 1),
-            (Some(0), 1),
-            (Some(1234), 1234),
-            (Some(-1234), -1234),
-        ] {
-            let xml = encode(&record, offset).unwrap();
-            assert!(xml.contains(&format!("<servertimediff>{expected}</servertimediff>")));
-            assert_eq!(xml.matches("<servertimediff>").count(), 1);
-            assert!(!xml.contains("<servertimediff>0</servertimediff>"));
-            assert!(xml.contains("<autorefresh>true</autorefresh>"));
-            assert_eq!(record, original, "the compatibility offset is XML-only");
-        }
+    let original = record.clone();
+    for (offset, expected) in [
+        (None, 1),
+        (Some(0), 1),
+        (Some(1234), 1234),
+        (Some(-1234), -1234),
+    ] {
+        let xml = encode(&record, offset).unwrap();
+        assert!(xml.contains(
+            "<secretdata encrypted=\"\">3132333435363738393031323334353637383930</secretdata>"
+        ));
+        assert!(xml.contains("<bnauth:serial></bnauth:serial>"));
+        assert!(xml.contains("<bnauth:restoreCode></bnauth:restoreCode>"));
+        assert!(xml.contains(&format!("<servertimediff>{expected}</servertimediff>")));
+        assert_eq!(xml.matches("<servertimediff>").count(), 1);
+        assert!(xml.contains("<autorefresh>true</autorefresh>"));
+        assert_eq!(record, original, "the compatibility offset is XML-only");
     }
 }
 
@@ -101,15 +82,12 @@ fn preserves_whitespace_and_maximum_stored_note_instead_of_display_truncation() 
 }
 
 #[test]
-fn rejects_missing_seed_and_unrepresentable_xml_instead_of_dropping_information() {
+fn rejects_unrepresentable_xml_instead_of_dropping_information() {
     let mut record = record();
     record.description = "有效 JSON 備註中的控制字元\u{1}".into();
     assert!(encode(&record, None).unwrap_err().contains("U+0001"));
     record.description = "\u{fffe}".into();
     assert!(encode(&record, None).unwrap_err().contains("U+FFFE"));
-    record.description.clear();
-    record.secret = None;
-    assert!(encode(&record, None).unwrap_err().contains("尚未取得密鑰"));
 }
 
 #[test]

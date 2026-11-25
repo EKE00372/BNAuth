@@ -1,10 +1,15 @@
 //! Readable UTF-8 JSON working files with strict schema and size validation.
-use bnauth_core::VaultSnapshot;
+use crate::operation_io_error;
+use bnauth_core::{
+    AuthenticatorFields, AuthenticatorRecord, ErrorCode, Group, GroupFields, ServiceTimeSync, Uuid,
+    ValidatedBackup, VaultFile, VaultSnapshot,
+};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    borrow::Cow,
     fmt,
     io::{self, Write},
 };
@@ -23,13 +28,17 @@ pub(crate) fn json_decode_calls() -> usize {
     JSON_DECODE_CALLS.with(std::cell::Cell::get)
 }
 
-struct LimitedBuffer(Zeroizing<Vec<u8>>);
-impl Write for LimitedBuffer {
+#[derive(Default)]
+struct LimitedWriter {
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+impl Write for LimitedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.0.len().saturating_add(bytes.len()) > MAX_FILE {
-            return Err(io::Error::other("資料大小超過 32 MiB 上限。"));
+        if bytes.len() > MAX_FILE - self.bytes.len() {
+            return Err(io::ErrorKind::FileTooLarge.into());
         }
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -39,181 +48,251 @@ impl Write for LimitedBuffer {
 
 pub fn encode(snapshot: &VaultSnapshot) -> Result<Zeroizing<Vec<u8>>, String> {
     snapshot.validate()?;
+    encode_validated(&snapshot.file_view())
+}
+
+/// Encode a committed full vault or its validated group export after replacing
+/// only the shared clock. Use `encode` or `encode_group` for unvalidated input.
+pub fn encode_backup_from_validated(
+    snapshot: &VaultFile<'_>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    snapshot.service_time_sync.validate()?;
     encode_validated(snapshot)
 }
 
 pub fn encode_group(snapshot: &VaultSnapshot) -> Result<Zeroizing<Vec<u8>>, String> {
     snapshot.validate_group_export()?;
-    encode_validated(snapshot)
+    encode_validated(&snapshot.file_view())
 }
 
-/// Internal serialization after the repository has validated the full candidate.
-/// Advancing its revision and timestamp preserves that validation; file-size
-/// limits still apply here, and installed bytes are independently read back.
-pub(crate) fn encode_validated(snapshot: &VaultSnapshot) -> Result<Zeroizing<Vec<u8>>, String> {
-    let mut body = LimitedBuffer(Zeroizing::new(Vec::new()));
+/// Serialize validated data with the native file-size limit.
+pub(crate) fn encode_validated(snapshot: &VaultFile<'_>) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut body = LimitedWriter::default();
+    let encode_error = |kind| {
+        let code = if kind == Some(io::ErrorKind::FileTooLarge) {
+            ErrorCode::FileTooLarge
+        } else {
+            ErrorCode::WriteFailed
+        };
+        code.notice().to_string()
+    };
     serde_json::to_writer_pretty(&mut body, snapshot)
-        .map_err(|_| "無法準備要保存的資料，或資料大小超過 32 MiB 上限。".to_owned())?;
+        .map_err(|error| encode_error(error.io_error_kind()))?;
     body.write_all(b"\n")
-        .map_err(|_| "資料大小超過 32 MiB 上限。".to_owned())?;
-    Ok(body.0)
+        .map_err(|error| encode_error(Some(error.kind())))?;
+    Ok(body.bytes)
 }
 
 pub fn decode(bytes: &[u8]) -> Result<VaultSnapshot, String> {
-    decode_scoped(bytes, false)
+    decode_scoped(bytes, false).map(ValidatedBackup::into_snapshot)
 }
 
 /// Inspect a group export without allowing it to be loaded as a working vault.
 pub fn decode_group(bytes: &[u8]) -> Result<VaultSnapshot, String> {
-    decode_scoped(bytes, true)
+    decode_scoped(bytes, true).map(ValidatedBackup::into_snapshot)
 }
 
 pub fn read_group(path: &Path) -> Result<VaultSnapshot, String> {
-    read_scoped(path, true)
+    read_group_for_import(path).map(ValidatedBackup::into_snapshot)
 }
 
 /// Read a full backup without accepting a partial group export as a database.
 pub fn read_full(path: &Path) -> Result<VaultSnapshot, String> {
-    read_scoped(path, false)
+    read_full_for_restore(path).map(ValidatedBackup::into_snapshot)
 }
 
-fn read_scoped(path: &Path, group: bool) -> Result<VaultSnapshot, String> {
-    let label = if group { "分組檔" } else { "完整備份" };
-    let file = File::open(path).map_err(|error| format!("無法開啟{label}（{error}）。"))?;
+pub fn read_group_for_import(path: &Path) -> Result<ValidatedBackup, String> {
+    decode_scoped(&read_bytes(path)?, true)
+}
+
+pub fn read_full_for_restore(path: &Path) -> Result<ValidatedBackup, String> {
+    decode_scoped(&read_bytes(path)?, false)
+}
+
+fn read_bytes(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    let report = |error: io::Error| {
+        operation_io_error(&error, ErrorCode::ReadFailed)
+            .notice()
+            .to_string()
+    };
+    let file = File::open(path).map_err(report)?;
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_FILE as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("無法讀取{label}（{error}）。"))?;
-    decode_scoped(&bytes, group)
+        .map_err(report)?;
+    Ok(bytes)
 }
 
-fn decode_scoped(bytes: &[u8], group: bool) -> Result<VaultSnapshot, String> {
+fn decode_scoped(bytes: &[u8], group: bool) -> Result<ValidatedBackup, String> {
+    let snapshot = serde_json::from_slice(json_body(bytes)?)
+        .map_err(|_| ErrorCode::CorruptFile.notice().to_string())?;
+    ValidatedBackup::new(snapshot, group)
+}
+
+#[derive(Deserialize)]
+struct FieldText<'a>(#[serde(borrow)] Cow<'a, str>);
+
+fn json_body(bytes: &[u8]) -> Result<&[u8], String> {
     if bytes.len() > MAX_FILE {
-        return Err("資料檔超過 32 MiB 上限。".into());
+        return Err(ErrorCode::FileTooLarge.notice().to_string());
     }
     // Editors may add a UTF-8 BOM or change line endings. Neither changes the DTO.
-    let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    decode_json(body, group)
-}
-
-fn decode_json(body: &[u8], group: bool) -> Result<VaultSnapshot, String> {
     #[cfg(all(test, windows))]
     JSON_DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let mut parser = serde_json::Deserializer::from_slice(body);
-    CheckJson { depth: 0 }
-        .deserialize(&mut parser)
+    Ok(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes))
+}
+
+/// Read back the file written by our encoder, comparing each decoded row with
+/// the already validated candidate while retaining only one row at a time.
+pub(crate) fn verify_written(
+    bytes: &[u8],
+    candidate: &VaultSnapshot,
+    revision: u64,
+) -> Result<(), String> {
+    let failure = || ErrorCode::WriteFailed.notice().to_string();
+    let mut parser = serde_json::Deserializer::from_slice(json_body(bytes)?);
+    parser
+        .deserialize_map(WrittenVault {
+            candidate,
+            revision,
+        })
         .and_then(|_| parser.end())
-        .map_err(|_| "資料檔內容有重複欄位、層次或項目過多，或格式錯誤。".to_owned())?;
-    let snapshot: VaultSnapshot = serde_json::from_slice(body)
-        .map_err(|_| "資料檔的格式或部分內容不受支援，無法讀取；原檔不會被覆寫。".to_owned())?;
-    if group {
-        snapshot.validate_group_export()?;
-    } else {
-        snapshot.validate()?;
+        .map_err(|_| failure())
+}
+
+struct WrittenVault<'a> {
+    candidate: &'a VaultSnapshot,
+    revision: u64,
+}
+
+impl<'de> Visitor<'de> for WrittenVault<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("the saved full vault")
     }
-    Ok(snapshot)
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let expected = self.candidate;
+        let mut seen = [false; 7];
+        while let Some(key) = map.next_key::<&str>()? {
+            let (field, matches) = match key {
+                "schema_version" => (0, map.next_value::<u32>()? == expected.schema_version),
+                "scope" => (1, map.next_value::<&str>()? == expected.scope),
+                "vault_id" => (2, map.next_value::<Uuid>()? == expected.vault_id),
+                "revision" => (3, map.next_value::<u64>()? == self.revision),
+                "groups" => (
+                    4,
+                    map.next_value_seed(MatchingRows(expected.groups.iter()))?,
+                ),
+                "authenticators" => (
+                    5,
+                    map.next_value_seed(MatchingRows(
+                        expected.authenticators.iter().map(|record| &**record),
+                    ))?,
+                ),
+                "service_time_sync" => (
+                    6,
+                    map.next_value::<ServiceTimeSync>()? == expected.service_time_sync,
+                ),
+                _ => return Err(de::Error::custom("unexpected saved field")),
+            };
+            if seen[field] || !matches {
+                return Err(de::Error::custom("saved field differs"));
+            }
+            seen[field] = true;
+        }
+        if seen.contains(&false) {
+            return Err(de::Error::custom("missing saved field"));
+        }
+        Ok(())
+    }
+}
+
+struct MatchingRows<I>(I);
+
+// The normal row types borrow unescaped text directly from the readback buffer.
+
+trait WrittenRow {
+    fn matches_next<'de, A: SeqAccess<'de>>(&self, seq: &mut A) -> Result<bool, A::Error>;
+}
+
+impl WrittenRow for Group {
+    fn matches_next<'de, A: SeqAccess<'de>>(&self, seq: &mut A) -> Result<bool, A::Error> {
+        Ok(seq
+            .next_element::<GroupFields<FieldText>>()?
+            .is_some_and(|row| {
+                row.id == self.id
+                    && row.name.0 == self.name
+                    && row.sort_order == self.sort_order
+                    && row.is_ungrouped == self.is_ungrouped
+            }))
+    }
+}
+
+impl WrittenRow for AuthenticatorRecord {
+    fn matches_next<'de, A: SeqAccess<'de>>(&self, seq: &mut A) -> Result<bool, A::Error> {
+        Ok(seq
+            .next_element::<AuthenticatorFields<FieldText>>()?
+            .is_some_and(|row| {
+                row.id == self.id
+                    && row.group_id == self.group_id
+                    && row.sort_order == self.sort_order
+                    && row.name.0 == self.name
+                    && row.description.0 == self.description
+                    && row.secret == self.secret
+                    && row.serial.as_ref().map(|text| text.0.as_ref()) == self.serial.as_deref()
+                    && row.restore_code.as_ref().map(|text| text.0.as_ref())
+                        == self.restore_code.as_deref()
+                    && row.digits == self.digits
+                    && row.algorithm.0 == self.algorithm
+                    && row.period_secs == self.period_secs
+            }))
+    }
+}
+
+impl<'de, I> DeserializeSeed<'de> for MatchingRows<I>
+where
+    Self: Visitor<'de, Value = bool>,
+{
+    type Value = bool;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+
+impl<'a, 'de, T, I> Visitor<'de> for MatchingRows<I>
+where
+    T: 'a + WrittenRow,
+    I: Iterator<Item = &'a T>,
+{
+    type Value = bool;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("the saved rows in order")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+        for expected in self.0 {
+            if !expected.matches_next(&mut seq)? {
+                return Ok(false);
+            }
+        }
+        Ok(seq.next_element::<de::IgnoredAny>()?.is_none())
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn read(path: &Path) -> Result<(VaultSnapshot, [u8; 32]), String> {
-    let file = File::open(path).map_err(|e| format!("無法讀取資料檔（{}）。", e))?;
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take(MAX_FILE as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("讀取資料檔失敗（{}）。", e))?;
+    let bytes = read_bytes(path)?;
     let snapshot = decode(&bytes)?;
     Ok((snapshot, Sha256::digest(&*bytes).into()))
-}
-
-// This pass checks bounds while parsing, before constructing collections in the DTO.
-struct CheckJson {
-    depth: usize,
-}
-impl<'de> DeserializeSeed<'de> for CheckJson {
-    type Value = ();
-    fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        deserializer.deserialize_any(self)
-    }
-}
-impl<'de> Visitor<'de> for CheckJson {
-    type Value = ();
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("bounded JSON")
-    }
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_none<E: de::Error>(self) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<(), E> {
-        if value.len() > 64 * 1024 {
-            Err(E::custom("string exceeds64KiB"))
-        } else {
-            Ok(())
-        }
-    }
-    fn visit_string<E: de::Error>(self, value: String) -> Result<(), E> {
-        self.visit_str(&value)
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        if self.depth >= 32 {
-            return Err(de::Error::custom("JSON depth exceeds32"));
-        }
-        let mut count = 0;
-        while seq
-            .next_element_seed(CheckJson {
-                depth: self.depth + 1,
-            })?
-            .is_some()
-        {
-            count += 1;
-            if count > 1000 {
-                return Err(de::Error::custom("array exceeds1000"));
-            }
-        }
-        Ok(())
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        if self.depth >= 32 {
-            return Err(de::Error::custom("JSON depth exceeds32"));
-        }
-        let mut keys = HashSet::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if key.len() > 256 || keys.len() >= 128 || !keys.insert(key) {
-                return Err(de::Error::custom("duplicate or excessive object key"));
-            }
-            map.next_value_seed(CheckJson {
-                depth: self.depth + 1,
-            })?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bnauth_core::{
-        Group, LegacyMetadata, Provenance, RecoveryEvent, TimeSyncRecord, Uuid, parse_manual,
-        prepare_import,
-    };
+    use bnauth_core::{Group, TimeSyncRecord, Uuid, parse_manual, prepare_import};
 
     fn full_snapshot() -> VaultSnapshot {
         const NOW: i64 = 1_800_000_000_000;
-        let mut vault = VaultSnapshot::new_empty(NOW);
+        let mut vault = VaultSnapshot::new_empty();
         let group = Uuid::new_v4();
         vault.groups.push(Group {
             id: group,
@@ -234,37 +313,19 @@ mod tests {
             "  中文 / Кириллица / 한글\n註記\t  ",
             group,
             material,
-            NOW + 10,
         )
         .unwrap()
-        .candidate;
+        .candidate(&vault)
+        .unwrap();
         vault.revision = 7;
-        vault.updated_at_ms = NOW + 20;
         let entry = &mut vault.authenticators[0];
-        entry.recovery_history.push(RecoveryEvent {
-            at_ms: NOW + 15,
-            operation: "fixture".into(),
-            outcome: "retained".into(),
-            confirmation: Some("人工紀錄".into()),
-        });
-        entry.legacy_metadata.push(LegacyMetadata {
-            source: "fixture".into(),
-            source_version: Some("1".into()),
-            field: "original_text".into(),
-            original_value: "  保留原文\n  ".into(),
-            unit: Some("text".into()),
-        });
-        let mut no_secret = entry.clone();
-        no_secret.id = Uuid::new_v4();
-        no_secret.group_id = vault.groups[0].id;
-        no_secret.name = "無密鑰紀錄".into();
-        no_secret.secret = None;
-        no_secret.serial = None;
-        no_secret.restore_code = None;
-        no_secret.restore_code_source = None;
-        no_secret.recovery_history.clear();
-        no_secret.legacy_metadata.clear();
-        vault.authenticators.push(no_secret);
+        let mut copy = entry.clone();
+        copy.id = Uuid::new_v4();
+        copy.group_id = vault.groups[0].id;
+        copy.name = "純密鑰紀錄".into();
+        copy.serial = None;
+        copy.restore_code = None;
+        vault.authenticators.push(copy);
         let sync = TimeSyncRecord {
             source: bnauth_core::TIME_SOURCE.into(),
             server_time_ms: NOW + 42,
@@ -272,14 +333,7 @@ mod tests {
             offset_ms: 42,
             rtt_ms: 100,
         };
-        vault.service_time_sync.battlenet = Some(sync.clone());
-        vault.provenance.push(Provenance {
-            source_vault_id: Uuid::new_v4(),
-            source_revision: 3,
-            scope: "full".into(),
-            imported_at_ms: NOW,
-            source_time_sync: Some(sync),
-        });
+        vault.service_time_sync.battlenet = Some(sync);
         vault.validate().unwrap();
         vault
     }
@@ -292,13 +346,15 @@ mod tests {
         assert!(text.starts_with("{\n  \"schema_version\": 1,"));
         assert!(text.ends_with("}\n"));
         assert!(text.contains("人工驗證器"));
-        assert!(text.contains("未分組"));
+        assert!(text.contains("預設"));
         assert!(!text.chars().any(|c| c == '\0'));
         assert_eq!(
             serde_json::from_slice::<VaultSnapshot>(&bytes).unwrap(),
             vault
         );
         assert_eq!(decode(&bytes).unwrap(), vault);
+        verify_written(&bytes, &vault, vault.revision).unwrap();
+        assert!(verify_written(&bytes, &vault, vault.revision + 1).is_err());
     }
 
     #[test]
@@ -314,8 +370,9 @@ mod tests {
         let mut expected = vault.clone();
         expected.authenticators[0].name = "文字編輯器改名".into();
         assert_eq!(decode(edited.as_bytes()).unwrap(), expected);
+        assert!(verify_written(edited.as_bytes(), &vault, vault.revision).is_err());
         assert_eq!(
-            bnauth_core::totp(expected.authenticators[0].secret.as_ref().unwrap(), 59_000).unwrap(),
+            bnauth_core::totp(&expected.authenticators[0].secret, 59_000).unwrap(),
             "94287082"
         );
     }
@@ -325,7 +382,20 @@ mod tests {
         let mut partial = full_snapshot();
         partial.scope = "group".into();
         assert!(encode(&partial).is_err());
-        let json = serde_json::to_string(&full_snapshot()).unwrap();
+        let vault = full_snapshot();
+        let json = serde_json::to_string(&vault).unwrap();
+        assert_eq!(
+            decode_group(json.as_bytes()).unwrap_err(),
+            ErrorCode::FullBackupSelected.notice().to_string()
+        );
+        // The scope can appear after the records in JSON saved by a text editor.
+        let reordered = json.replacen("\"scope\":\"full\",", "", 1);
+        let reordered = format!("{},\"scope\":\"full\"}}", &reordered[..reordered.len() - 1]);
+        assert_eq!(decode(reordered.as_bytes()).unwrap(), vault);
+        assert_eq!(
+            decode_group(reordered.as_bytes()).unwrap_err(),
+            ErrorCode::FullBackupSelected.notice().to_string()
+        );
         let duplicate = json.replacen('{', "{\"schema_version\":1,", 1);
         let nested_duplicate = json.replacen(
             "\"name\":\"人工驗證器\"",
@@ -333,6 +403,7 @@ mod tests {
             1,
         );
         let unknown = json.replacen('{', "{\"unrecognized\":true,", 1);
+        let unknown_entry = json.replacen("\"digits\":8", "\"unrecognized\":true,\"digits\":8", 1);
         let schema = json.replace("\"schema_version\":1", "\"schema_version\":2");
         let scope = json.replace("\"scope\":\"full\"", "\"scope\":\"group\"");
         let truncated = json[..json.len() - 1].to_owned();
@@ -342,6 +413,7 @@ mod tests {
             duplicate,
             nested_duplicate,
             unknown,
+            unknown_entry,
             schema,
             scope,
             truncated,
@@ -350,36 +422,44 @@ mod tests {
             "[".repeat(34) + &"]".repeat(34),
         ] {
             assert!(decode(body.as_bytes()).is_err());
+            assert!(verify_written(body.as_bytes(), &vault, vault.revision).is_err());
         }
         assert!(decode(&[0xff, 0xfe]).is_err());
-        assert!(decode(&[]).is_err());
+        assert_eq!(
+            decode(&[]).unwrap_err(),
+            ErrorCode::CorruptFile.notice().to_string()
+        );
         assert!(decode(b" \r\n\t").is_err());
     }
 
     #[test]
     fn json_file_size_limit_is_enforced() {
-        let vault = VaultSnapshot::new_empty(1_800_000_000_000);
+        let vault = VaultSnapshot::new_empty();
         let mut body = serde_json::to_vec(&vault).unwrap();
         body.resize(MAX_FILE, b' ');
         assert_eq!(decode(&body).unwrap(), vault);
         body.push(b' ');
-        assert!(decode(&body).unwrap_err().contains("32 MiB"));
+        assert_eq!(
+            decode(&body).unwrap_err(),
+            "E15：檔案過大\n超過 32 MiB 上限。"
+        );
     }
 
     #[test]
     fn writer_size_and_parser_depth_limits_are_enforced() {
-        let mut writer = LimitedBuffer(Zeroizing::new(Vec::new()));
+        let mut writer = LimitedWriter::default();
         writer.write_all(&vec![b' '; MAX_FILE]).unwrap();
-        assert_eq!(writer.0.len(), MAX_FILE);
-        assert!(writer.write_all(b"x").is_err());
-        assert_eq!(writer.0.len(), MAX_FILE);
-        for (depth, expected) in [(32, true), (33, false)] {
-            let json = "[".repeat(depth) + "0" + &"]".repeat(depth);
-            let mut parser = serde_json::Deserializer::from_str(&json);
-            assert_eq!(
-                CheckJson { depth: 0 }.deserialize(&mut parser).is_ok(),
-                expected
-            );
+        assert_eq!(writer.bytes.len(), MAX_FILE);
+        assert_eq!(
+            writer.write_all(b"x").unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        assert_eq!(writer.bytes.len(), MAX_FILE);
+        let vault = serde_json::to_string(&VaultSnapshot::new_empty()).unwrap();
+        for (depth, expected) in [(31, true), (32, false)] {
+            let value = "[".repeat(depth) + "0" + &"]".repeat(depth);
+            let json = vault.replacen('{', &format!("{{\"created_at_ms\":{value},"), 1);
+            assert_eq!(decode(json.as_bytes()).is_ok(), expected);
         }
     }
 }

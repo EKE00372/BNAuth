@@ -1,7 +1,9 @@
 use super::*;
 use bnauth_adapters::{export_file, native};
-use bnauth_core::{FullRestorePreview, clock::ClockObservation};
+use bnauth_core::{ErrorCode, FullRestorePreview, FullRestoreTarget, clock::ClockObservation};
 use std::{path::PathBuf, sync::mpsc::TryRecvError};
+
+pub(super) use export_file::FULL_RESTORE_TITLE as TITLE;
 
 pub(crate) struct RestoreFile {
     pub path: PathBuf,
@@ -19,7 +21,7 @@ impl BnAuthApp {
     pub(super) fn open_full_restore(&mut self, ctx: &egui::Context) {
         if self.runtime.close_requested
             || self.runtime.full_restore_rx.is_some()
-            || self.runtime.export_rx.is_some()
+            || self.runtime.export_job.is_some()
             || self.runtime.group_import_rx.is_some()
         {
             return;
@@ -28,16 +30,21 @@ impl BnAuthApp {
     }
 
     fn begin_full_restore(&mut self) -> Result<(), String> {
-        let target = self.runtime.app.current.clone();
+        let target = self
+            .runtime
+            .app
+            .current
+            .as_deref()
+            .map(FullRestoreTarget::from);
         let primary = self.runtime.path.clone();
         let directory = self
             .runtime
             .path
             .parent()
-            .ok_or("無法取得程式所在目錄。")?
+            .ok_or_else(|| ErrorCode::ReadFailed.notice().to_string())?
             .to_path_buf();
         let owner = export_file::active_window();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = crate::runtime::worker_channel(&self.runtime.ui_ctx);
         std::thread::Builder::new()
             .name("bnauth-full-restore".into())
             .spawn(move || {
@@ -56,28 +63,20 @@ impl BnAuthApp {
                         _ => false,
                     };
                     if path.as_os_str().eq_ignore_ascii_case(primary.as_os_str()) || same_resolved {
-                        return Err(
-                            "還原來源不能是目前的 BNAuth.bnauth 主檔，請選擇獨立的完整備份。"
-                                .into(),
-                        );
+                        return Err("請勿重覆匯入。".into());
                     }
-                    let source = native::read_full(&path)?;
-                    let preview = bnauth_core::prepare_full_restore(
-                        target.as_ref(),
-                        &source,
-                        bnauth_core::now_ms(),
-                    )?;
-                    native::encode(&preview.candidate)?;
+                    let source = native::read_full_for_restore(&path)?;
+                    let preview = bnauth_core::prepare_full_restore_from_validated(target, source)?;
                     Ok(Some(RestoreFile { path, preview }))
                 })();
-                let _ = tx.send(result);
+                tx.send(result);
             })
-            .map_err(|error| format!("無法啟動完整還原（{error}）。"))?;
+            .map_err(|_| ErrorCode::ReadFailed.notice().to_string())?;
         self.runtime.full_restore_rx = Some(rx);
         Ok(())
     }
 
-    pub(super) fn poll_full_restore(&mut self, ctx: &egui::Context) {
+    pub(super) fn poll_full_restore(&mut self) {
         let result = self
             .runtime
             .full_restore_rx
@@ -86,7 +85,7 @@ impl BnAuthApp {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
-                    Some(Err("備份讀取工作中斷，請重新選擇檔案。".into()))
+                    Some(Err(ErrorCode::ReadFailed.notice().to_string()))
                 }
             });
         let Some(result) = result else { return };
@@ -106,12 +105,6 @@ impl BnAuthApp {
                     form.confirmed = false;
                     form.error.clone_from(&error);
                 }
-                if self.runtime.close_requested {
-                    self.runtime.close_requested = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                }
                 self.warn(error);
             }
         }
@@ -123,21 +116,25 @@ impl BnAuthApp {
         form: &mut RestoreForm,
     ) -> bool {
         ui.add_space(8.0);
-        ui.label("選擇完整 .bnauth 備份，保留全部分組名稱、驗證器完整資料及排序。");
-        ui.label("分組檔請使用「匯入分組檔…」。完整還原會取代目前資料庫。");
+        ui.label("選擇完整的 .bnauth 備份檔案，匯入全部分組名稱、驗證器資料及排序。");
+        ui.colored_label(RED, "完整還原會取代目前資料庫。");
+        if !ErrorCode::GroupBackupSelected.matches_message(&form.error) {
+            ui.label(ErrorCode::GroupBackupSelected.default_detail().unwrap_or_default());
+        }
         ui.add_space(8.0);
         let busy = self.runtime.full_restore_rx.is_some();
         if busy {
             ui.spinner();
-            ui.label("請選擇完整備份，正在讀取與驗證…");
+            ui.label("請選擇完整備份，正在讀取與驗證");
         }
         if ui
-            .add_enabled(!busy, egui::Button::new("選擇完整備份…"))
+            .add_enabled(!busy, egui::Button::new("選擇檔案"))
             .clicked()
+            && let Err(error) = self.begin_full_restore()
         {
-            form.error = self.begin_full_restore().err().unwrap_or_default();
+            form.error = error;
         }
-        if let Some(loaded) = &form.loaded {
+        if let Some(loaded) = &mut form.loaded {
             let preview = &loaded.preview;
             let snapshot = &preview.candidate;
             ui.add_space(8.0);
@@ -154,37 +151,28 @@ impl BnAuthApp {
                 snapshot.groups.len(),
                 snapshot.authenticators.len()
             ));
-            if let Some(current) = &self.runtime.app.current {
-                ui.colored_label(
-                    RED,
-                    format!(
-                        "目前 {} 個分組、{} 個驗證器將由備份內容完整取代。",
-                        current.groups.len(),
-                        current.authenticators.len()
-                    ),
-                );
-                ui.label("取代前會在 EXE 同目錄保存並驗證「BNAuth-before-restore-….bnauth」副本；副本失敗就停止還原。");
+            if self.runtime.app.current.is_some() {
+                ui.colored_label(RED, "目前資料將被全部取代。");
             } else {
                 ui.label("將在 EXE 同目錄建立 BNAuth.bnauth。");
             }
             ui.add_space(8.0);
             for (index, group) in snapshot.groups.iter().enumerate() {
-                let count = snapshot
-                    .authenticators
-                    .iter()
-                    .filter(|record| record.group_id == group.id)
-                    .count();
+                let count = preview
+                    .group_counts
+                    .get(&group.id)
+                    .copied()
+                    .unwrap_or_default();
                 ui.label(format!("{}. {} · {} 個", index + 1, group.name, count));
             }
             ui.add_space(12.0);
             if preview.base.is_some() {
-                ui.checkbox(&mut form.confirmed, "我確認以備份取代目前全部資料");
+                ui.checkbox(&mut form.confirmed, "我已知曉目前資料將被全部取代。");
             }
             if ui
                 .add_enabled(
                     !busy && (preview.base.is_none() || form.confirmed),
-                    egui::Button::new(egui::RichText::new("確認還原並保存").color(ON_ACCENT))
-                        .fill(BLUE),
+                    egui::Button::new(egui::RichText::new("還原").color(ON_ACCENT)).fill(BLUE),
                 )
                 .clicked()
             {
@@ -197,27 +185,41 @@ impl BnAuthApp {
                 if current_base != preview.base {
                     form.error = "資料庫已變更，請重新選擇備份並預覽。".into();
                 } else {
-                    let context = self.runtime.clock_storage_context();
-                    self.observe_shared_clock(ClockObservation::now(), &context);
-                    let mut candidate = preview.candidate.clone();
-                    if candidate
-                        .service_time_sync
-                        .battlenet
-                        .as_ref()
-                        .is_some_and(|record| {
-                            self.runtime.invalidated_clock_records.contains(record)
-                        })
-                    {
-                        // The restore provenance already preserves the source
-                        // result; do not activate and then rewrite a known-invalid one.
-                        candidate.service_time_sync.battlenet = None;
-                    }
-                    match self.runtime.app.restore(candidate, preview.new_secret) {
-                        Ok(()) => {
-                            self.runtime.pending_full_restore = true;
-                            return false;
+                    self.observe_shared_clock(ClockObservation::now());
+                    let invalid_backup_clock = crate::runtime::RuntimeState::unusable_backup_clock(
+                        preview.candidate.service_time_sync.battlenet.as_ref(),
+                    );
+                    let replacement_clock = invalid_backup_clock
+                        .then(|| self.runtime.clock.last_success().cloned())
+                        .flatten();
+                    let submitted = self.runtime.app.restore_from_preview(|| {
+                        let mut candidate = form
+                            .loaded
+                            .take()
+                            .expect("confirmed restore preview")
+                            .preview
+                            .candidate;
+                        if invalid_backup_clock {
+                            candidate
+                                .service_time_sync
+                                .battlenet
+                                .clone_from(&replacement_clock);
                         }
-                        Err(error) => form.error = error,
+                        candidate
+                    });
+                    if form.loaded.is_none() {
+                        self.runtime.pending_full_restore = true;
+                        self.runtime.pending_clock_merge = invalid_backup_clock;
+                        self.runtime.clock_save_manual =
+                            replacement_clock.is_some() && self.runtime.pending_clock_manual;
+                        self.runtime.clock_save_inflight = replacement_clock;
+                        if let Err(error) = submitted {
+                            self.runtime.app.error = Some(error);
+                        }
+                        return false;
+                    }
+                    if let Err(error) = submitted {
+                        form.error = error;
                     }
                 }
             }

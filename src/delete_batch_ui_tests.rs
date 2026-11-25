@@ -83,12 +83,32 @@ fn each_delete_batch_starts_at_the_top_without_resetting_an_open_batch_or_saving
         frame(&mut ui, Vec::new());
     }
     let token = ui.app.model.change_token();
-    click(&mut ui, "全選");
+    click(&mut ui, "根據名稱查找");
+    for (key, modifiers) in [
+        (egui::Key::ArrowDown, egui::Modifiers::NONE),
+        (egui::Key::A, egui::Modifiers::CTRL),
+        (egui::Key::Delete, egui::Modifiers::NONE),
+    ] {
+        for pressed in [true, false] {
+            frame(
+                &mut ui,
+                vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::Key {
+                        key,
+                        physical_key: Some(key),
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    },
+                ],
+            );
+        }
+    }
     assert_eq!(ui.app.selected.len(), 100);
-    click(&mut ui, "刪除");
-    assert!(!ui.points("Row 0000 · 未分組").is_empty());
+    assert!(!ui.points("Row 0000 · 預設").is_empty());
     scroll_to_tail(&mut ui);
-    assert!(!ui.points("Row 0099 · 未分組").is_empty());
+    assert!(!ui.points("Row 0099 · 預設").is_empty());
     click(&mut ui, "×");
     assert!(ui.app.dialog.is_none());
     frame(&mut ui, Vec::new());
@@ -138,7 +158,7 @@ fn each_delete_batch_starts_at_the_top_without_resetting_an_open_batch_or_saving
         scroll_states
     );
     assert_eq!(ui.app.model.snapshot(), vault);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&vault));
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&vault));
     assert_eq!(ui.app.model.change_token(), token);
     assert!(!ui.app.runtime.app.saving && !ui.app.runtime.app.has_pending());
 }

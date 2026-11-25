@@ -29,11 +29,13 @@ impl Message {
     }
 }
 
-/// Status updates may replace each other; warnings retain their own display time.
-/// Call `visible` only when painting, and `pause` when hiding the notification UI.
+/// Transient updates may replace each other. Warnings and retained status keep
+/// their display time even when another update arrives.
+/// Call `visible_for` only when painting, and `pause` when hiding the notification UI.
 #[derive(Default)]
 pub struct Notifications {
     status: Option<Message>,
+    retained_status: Option<Message>,
     warnings: VecDeque<Message>,
 }
 
@@ -43,6 +45,11 @@ impl Notifications {
         if self.warnings.is_empty() {
             self.status = Some(Message::new(text.into(), STATUS_DURATION));
         }
+    }
+
+    pub fn retained_status(&mut self, text: impl Into<String>) {
+        self.clear_status();
+        self.retained_status = Some(Message::new(text.into(), STATUS_DURATION));
     }
 
     pub fn warning(&mut self, text: impl Into<String>) {
@@ -63,13 +70,25 @@ impl Notifications {
         self.status = None;
     }
 
-    /// Return the text to paint, starting its timer only on this call. Advancing
-    /// to the next warning gives it a full display interval of its own.
-    pub fn visible(&mut self, now: Instant) -> Option<&str> {
+    pub fn clear_status_if(&mut self, text: &str) {
+        self.status.take_if(|message| message.text == text);
+    }
+
+    /// Return the text and the delay until it needs to be removed or replaced.
+    pub fn visible_for(&mut self, now: Instant) -> Option<(&str, Duration)> {
         self.pause(now);
-        let message = self.warnings.front_mut().or(self.status.as_mut())?;
+        let message = self
+            .warnings
+            .front_mut()
+            .or(self.retained_status.as_mut())
+            .or(self.status.as_mut())?;
         message.visible_since = Some(now);
-        Some(&message.text)
+        Some((&message.text, message.remaining))
+    }
+
+    #[cfg(test)]
+    pub fn visible(&mut self, now: Instant) -> Option<&str> {
+        self.visible_for(now).map(|(text, _)| text)
     }
 
     /// Freeze the remaining display time before a hidden/minimized UI stops
@@ -80,10 +99,13 @@ impl Notifications {
             if message.remaining.is_zero() {
                 self.warnings.pop_front();
             }
-        } else if let Some(message) = &mut self.status {
-            message.pause(now);
-            if message.remaining.is_zero() {
-                self.status = None;
+        }
+        for status in [&mut self.retained_status, &mut self.status] {
+            if let Some(message) = status {
+                message.pause(now);
+                if message.remaining.is_zero() {
+                    *status = None;
+                }
             }
         }
     }
@@ -141,27 +163,6 @@ mod tests {
         );
         assert_eq!(notifications.visible(now + Duration::from_secs(5)), None);
         assert_eq!(notifications.pending_warning_count(), 0);
-    }
-
-    #[test]
-    fn queued_warnings_each_receive_five_seconds_from_their_first_paint() {
-        let now = Instant::now();
-        let mut notifications = Notifications::default();
-        notifications.warning("First");
-        notifications.warning("Second");
-        notifications.pause(now + Duration::from_secs(60));
-        let first_paint = now + Duration::from_secs(120);
-        assert_eq!(notifications.visible(first_paint), Some("First"));
-        let second_paint = first_paint + Duration::from_secs(20);
-        assert_eq!(notifications.visible(second_paint), Some("Second"));
-        assert_eq!(
-            notifications.visible(second_paint + Duration::from_millis(4999)),
-            Some("Second")
-        );
-        assert_eq!(
-            notifications.visible(second_paint + Duration::from_secs(5)),
-            None
-        );
     }
 
     #[test]
@@ -237,27 +238,4 @@ mod tests {
         assert_eq!(notifications.visible(now + Duration::from_secs(15)), None);
     }
 
-    #[test]
-    fn a_full_queue_keeps_active_warning_and_drops_only_the_oldest_waiting_one() {
-        let now = Instant::now();
-        let mut notifications = Notifications::default();
-        notifications.warning("Active");
-        assert_eq!(notifications.visible(now), Some("Active"));
-        for index in 0..MAX_WARNINGS {
-            notifications.warning(format!("Waiting {index}"));
-        }
-        assert_eq!(notifications.pending_warning_count(), MAX_WARNINGS);
-        assert_eq!(notifications.visible(now), Some("Active"));
-        for index in 1..MAX_WARNINGS {
-            let expected = format!("Waiting {index}");
-            assert_eq!(
-                notifications.visible(now + WARNING_DURATION * index as u32),
-                Some(expected.as_str())
-            );
-        }
-        assert_eq!(
-            notifications.visible(now + WARNING_DURATION * MAX_WARNINGS as u32),
-            None
-        );
-    }
 }

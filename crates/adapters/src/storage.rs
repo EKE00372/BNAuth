@@ -1,6 +1,6 @@
 //! Durable single-writer repository. All methods and Drop stay on its worker thread.
-use crate::native;
-use bnauth_core::{VaultSnapshot, now_ms};
+use crate::{native, operation_io_error, temp_cleanup_error};
+use bnauth_core::{ErrorCode, VaultSnapshot};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
@@ -28,107 +28,215 @@ struct FileStamp {
     identity: FileIdentity,
     hash: [u8; 32],
 }
+
+// The UI owns the decoded vault. The header checks candidate revisions and the
+// stamp identifies the exact file and bytes that were decoded and acknowledged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AcknowledgedPrimary {
+    vault_id: Uuid,
+    revision: u64,
+    stamp: FileStamp,
+}
+
+impl AcknowledgedPrimary {
+    fn new(snapshot: &VaultSnapshot, stamp: FileStamp) -> Self {
+        Self {
+            vault_id: snapshot.vault_id,
+            revision: snapshot.revision,
+            stamp,
+        }
+    }
+}
+
+enum PrimaryCheck {
+    Identity,
+    Fingerprint,
+}
+
 #[derive(Clone, Debug)]
 struct OwnedFile {
     path: PathBuf,
     stamp: FileStamp,
 }
+struct RollbackGuard {
+    file: File,
+    can_delete: bool,
+}
+impl RollbackGuard {
+    fn into_delete_handle(self) -> Option<File> {
+        self.can_delete.then_some(self.file)
+    }
+}
 struct CleanupFailure {
-    message: String,
-    changed: bool,
+    code: ErrorCode,
+    changed: Option<String>,
 }
 impl CleanupFailure {
-    fn retry(message: String) -> Self {
+    fn retry(code: ErrorCode) -> Self {
         Self {
-            message,
-            changed: false,
+            code,
+            changed: None,
         }
     }
     fn changed(message: String) -> Self {
         Self {
-            message,
-            changed: true,
+            code: ErrorCode::DeleteFailed,
+            changed: Some(message),
         }
     }
 }
 
 // The caller holds a handle that denies outside writes and renames throughout
-// identity capture and bounded reading. Partial staged files need no JSON decode.
+// identity capture and bounded reading.
 fn inspect_open(file: &mut File) -> Result<(Zeroizing<Vec<u8>>, FileStamp), String> {
     let identity = platform::file_identity(file)?;
-    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take(native::MAX_FILE as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(io_error)?;
-    if bytes.len() > native::MAX_FILE {
-        return Err("資料檔過大，超過 32 MiB 上限。".into());
-    }
+    let bytes = read_open(file)?;
     let hash = Sha256::digest(&*bytes).into();
     Ok((bytes, FileStamp { identity, hash }))
 }
-struct OpenedPrimary {
+
+fn read_open(file: &mut File) -> Result<Zeroizing<Vec<u8>>, String> {
+    file.seek(SeekFrom::Start(0)).map_err(primary_io_error)?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(native::MAX_FILE as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(primary_io_error)?;
+    if bytes.len() > native::MAX_FILE {
+        return Err(ErrorCode::FileTooLarge.notice().to_string());
+    }
+    Ok(bytes)
+}
+
+fn stamp_open(file: &mut File) -> Result<FileStamp, String> {
+    stamp_and_compare(file, None).map(|(stamp, _)| stamp)
+}
+
+fn stamp_and_compare(
+    file: &mut File,
+    expected: Option<&[u8]>,
+) -> Result<(FileStamp, bool), String> {
+    let identity = platform::file_identity(file)?;
+    file.rewind().map_err(primary_io_error)?;
+    let mut reader = file.take(native::MAX_FILE as u64 + 1);
+    let mut buffer = Zeroizing::new([0_u8; 16 * 1024]);
+    let mut hash = Sha256::new();
+    let mut remaining = expected;
+    loop {
+        match reader.read(&mut buffer[..]) {
+            Ok(0) => break,
+            Ok(_) if reader.limit() == 0 => {
+                return Err(ErrorCode::FileTooLarge.notice().to_string());
+            }
+            Ok(n) => {
+                hash.update(&buffer[..n]);
+                remaining = remaining.and_then(|bytes| bytes.strip_prefix(&buffer[..n]));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(primary_io_error(error)),
+        }
+    }
+    Ok((
+        FileStamp {
+            identity,
+            hash: hash.finalize().into(),
+        },
+        remaining == Some(&[]),
+    ))
+}
+
+struct OpenedPrimary<T> {
     file: File,
-    snapshot: VaultSnapshot,
+    decoded: T,
     stamp: FileStamp,
 }
 
-fn open_primary(path: &Path) -> Result<Option<OpenedPrimary>, String> {
-    let Some(mut file) = platform::open_guarded(path, false)? else {
+fn open_primary(
+    path: &Path,
+    allow_rename: bool,
+) -> Result<Option<OpenedPrimary<VaultSnapshot>>, String> {
+    read_primary(path, allow_rename, |bytes, _| {
+        native::decode(bytes).map_err(|error| {
+            if ErrorCode::GroupBackupSelected.matches_message(&error) {
+                ErrorCode::GroupBackupSelected
+                    .with_detail("這是分組備份。\n請先用完整設定檔開啟 BNAuth，再使用「匯入單組備份」。")
+                    .to_string()
+            } else {
+                error
+            }
+        })
+    })
+}
+
+fn read_primary<T>(
+    path: &Path,
+    allow_rename: bool,
+    decode: impl FnOnce(&[u8], FileStamp) -> Result<T, String>,
+) -> Result<Option<OpenedPrimary<T>>, String> {
+    let Some(mut file) = platform::open_guarded(path, allow_rename)? else {
         return Ok(None);
     };
     let (bytes, stamp) = inspect_open(&mut file)?;
     Ok(Some(OpenedPrimary {
         file,
-        snapshot: native::decode(&bytes)?,
+        decoded: decode(&bytes, stamp)?,
         stamp,
     }))
-}
-
-fn read_locked(path: &Path) -> Result<Option<(VaultSnapshot, FileStamp)>, String> {
-    Ok(open_primary(path)?.map(|opened| (opened.snapshot, opened.stamp)))
 }
 
 fn read_stamp_locked(path: &Path) -> Result<Option<FileStamp>, String> {
     let Some(mut file) = platform::open_guarded(path, false)? else {
         return Ok(None);
     };
-    let (_, stamp) = inspect_open(&mut file)?;
-    Ok(Some(stamp))
+    stamp_open(&mut file).map(Some)
 }
 
 fn delete_owned(owned: &OwnedFile, inject_failure: bool) -> Result<(), CleanupFailure> {
-    let Some(mut file) =
-        platform::open_guarded(&owned.path, true).map_err(CleanupFailure::retry)?
-    else {
+    let Some(mut file) = platform::open_guarded_io(&owned.path, true).map_err(cleanup_io_error)? else {
         return Ok(());
     };
-    let (bytes, actual) = inspect_open(&mut file).map_err(CleanupFailure::retry)?;
-    drop(bytes);
+    let actual = stamp_open(&mut file).map_err(|_| {
+        CleanupFailure::changed(format!("無法核對暫存檔。請保留檔案：{}", owned.path.display()))
+    })?;
     if actual != owned.stamp {
         return Err(CleanupFailure::changed(format!(
             "暫存檔已被外部修改或替換，已保留在原位置，不會刪除：{}",
             owned.path.display()
         )));
     }
+    delete_verified(&file, inject_failure)
+}
+
+fn delete_verified(file: &File, inject_failure: bool) -> Result<(), CleanupFailure> {
     if inject_failure {
-        return Err(CleanupFailure::retry("模擬清理失敗。".into()));
+        return Err(CleanupFailure::retry(ErrorCode::FileInUse));
     }
     // Keep this exact verified handle open through disposition; a path-based
     // delete after closing it would reintroduce a check/delete race.
-    platform::delete_open(&file).map_err(CleanupFailure::retry)
+    platform::delete_open(file).map_err(cleanup_io_error)
+}
+
+fn primary_is_read_only(primary: Option<&File>) -> Result<bool, String> {
+    let Some(primary) = primary else {
+        return Ok(false);
+    };
+    let metadata = primary.metadata().map_err(primary_io_error)?;
+    Ok(metadata.permissions().readonly())
+}
+
+struct NtfsDirectory {
+    path: PathBuf,
+    read_only_volume: bool,
 }
 
 pub struct Repository {
     path: PathBuf,
     original_parent: PathBuf,
     canonical_parent: PathBuf,
-    current: Option<VaultSnapshot>,
-    fingerprint: Option<FileStamp>,
+    current: Option<AcknowledgedPrimary>,
+    write_access_denied: bool,
+    primary_read_only: bool,
     blocked: bool,
     cleanup_pending: Vec<OwnedFile>,
-    restore_copy: Option<(FileStamp, OwnedFile)>,
-    last_restore_backup: Option<PathBuf>,
     // Release the deny-write/delete handle before the named mutex on Drop.
     primary_guard: Option<File>,
     _lock: platform::Lock,
@@ -142,46 +250,52 @@ impl Repository {
             .parent()
             .ok_or("未指定資料檔所在的資料夾。")?
             .to_path_buf();
-        let canonical_parent = platform::canonical_ntfs_directory(&original_parent)?;
+        let NtfsDirectory {
+            path: canonical_parent,
+            read_only_volume,
+        } = platform::canonical_ntfs_directory(&original_parent)?;
         let path = canonical_parent.join("BNAuth.bnauth");
         let lock = platform::Lock::acquire(&path)?;
-        if platform::canonical_ntfs_directory(&original_parent)? != canonical_parent {
+        if platform::canonical_directory(&original_parent)? != canonical_parent {
             return Err("開啟資料檔時，所在的資料夾已變更。請重新開啟 BNAuth。".into());
         }
+        // Our primary guard denies deletion, so check replacement access before acquiring it.
+        let write_access_denied =
+            read_only_volume || platform::save_access_denied(&canonical_parent, &path);
+        let primary = open_primary(&path, false);
         let remnants = find_remnants(&canonical_parent)?;
-        if !remnants.is_empty() {
-            let names = remnants
-                .iter()
-                .map(|p| {
-                    let status = read_locked(p)
-                        .ok()
-                        .flatten()
-                        .map(|(v, _)| format!("資料完整且可讀取，資料版本 {}", v.revision))
-                        .unwrap_or_else(|| "無法確認資料是否完整".into());
-                    format!("{}（{status}）", p.display())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(format!(
-                "發現上次保存留下的檔案，無法確認上次是否保存完成，已停止保存。請保留並檢查下列檔案，程式不會自動使用或刪除它們：\n{names}"
-            ));
-        }
-        let (current, fingerprint, primary_guard) = match open_primary(&path)? {
-            Some(opened) => (Some(opened.snapshot), Some(opened.stamp), Some(opened.file)),
-            None => (None, None, None),
+        let fallback_read_only = matches!(primary, Ok(None)) && write_access_denied;
+        let primary = match primary {
+            Ok(None) => recover_startup_primary(&path, &remnants, write_access_denied),
+            primary => primary,
         };
-        let loaded = current.clone();
+        let acknowledged = primary
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|opened| AcknowledgedPrimary::new(&opened.decoded, opened.stamp));
+        let cleanup = clean_startup_remnants(
+            &remnants,
+            &original_parent,
+            write_access_denied,
+            acknowledged.is_some() && !fallback_read_only,
+        );
+        let (loaded, primary_guard) = match primary? {
+            Some(opened) => (Some(opened.decoded), Some(opened.file)),
+            None => (None, None),
+        };
+        cleanup?;
+        let primary_read_only = primary_is_read_only(primary_guard.as_ref())?;
         Ok((
             Self {
                 path,
                 original_parent,
                 canonical_parent,
-                current,
-                fingerprint,
+                current: acknowledged,
+                write_access_denied,
+                primary_read_only,
                 blocked: false,
                 cleanup_pending: vec![],
-                restore_copy: None,
-                last_restore_backup: None,
                 primary_guard,
                 _lock: lock,
                 _thread_bound: PhantomData,
@@ -194,128 +308,69 @@ impl Repository {
     pub fn cleanup_required(&self) -> bool {
         !self.cleanup_pending.is_empty()
     }
+    pub fn defer_cleanup(&mut self) {
+        if !self.blocked {
+            self.cleanup_pending.clear();
+        }
+    }
     pub fn is_blocked(&self) -> bool {
         self.blocked
     }
-
-    pub fn restore_backup(&self) -> Option<&Path> {
-        self.last_restore_backup.as_deref()
+    pub fn is_read_only(&self) -> bool {
+        self.write_access_denied || self.primary_read_only
     }
 
-    /// A replacement restore must first preserve a verified, independent copy
-    /// of the last acknowledged primary. This copy is never transaction residue.
-    pub fn restore(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
-        self.validate_candidate(candidate)?;
-        self.check_current()?;
-        let backup = self.prepare_restore_copy()?;
-        // Keep the verified copy protected from outside writes/deletion until
-        // the ordinary commit has either succeeded or retained its candidate.
-        let result = self.commit_validated(candidate);
-        if result.is_ok() {
-            // IO remains bound to the verified volume path. Report the same
-            // filename through the original, user-readable directory spelling.
-            self.last_restore_backup = backup.as_ref().map(|(_, path)| {
-                self.original_parent.join(
-                    path.file_name()
-                        .expect("generated safety copy has a filename"),
-                )
-            });
-        }
-        drop(backup);
-        result
-    }
-
-    fn prepare_restore_copy(&mut self) -> Result<Option<(File, PathBuf)>, String> {
-        let Some(expected) = self.fingerprint else {
-            return Ok(None);
-        };
-        if let Some((source, owned)) = &self.restore_copy
-            && *source == expected
-        {
-            let mut file = platform::open_guarded(&owned.path, false)?
-                .ok_or("還原前副本已不存在，未取代目前資料；請保留檔案並重新開啟程式。")?;
-            // This stamp identifies the same bytes already decoded and validated
-            // as the acknowledged primary; the held handle protects the copy.
-            let (_, stamp) = inspect_open(&mut file)?;
-            if stamp != owned.stamp {
-                return Err(
-                    "還原前副本已被外部修改，未取代目前資料；請保留檔案並重新開啟程式。".into(),
-                );
-            }
-            return Ok(Some((file, owned.path.clone())));
-        }
-        let mut original =
-            platform::open_guarded(&self.path, false)?.ok_or("目前資料檔已不存在，未開始還原。")?;
-        let (bytes, stamp) = inspect_open(&mut original)?;
-        if stamp != expected {
-            return Err("目前資料檔與已載入資料不同，未開始還原。".into());
-        }
-        self.inject(FaultPoint::BeforeRestoreCopy)?;
-        let path = self.canonical_parent.join(format!(
-            "BNAuth-before-restore-{}-{}.bnauth",
-            now_ms(),
-            Uuid::new_v4()
-        ));
-        let mut copy = platform::create_temp(&path)
-            .map_err(|error| format!("無法建立還原前副本，未取代目前資料（{error}）。"))?;
-        let verified: Result<FileStamp, String> = (|| {
-            copy.write_all(&bytes).map_err(io_error)?;
-            self.inject(FaultPoint::RestoreCopyFlush)?;
-            copy.sync_all().map_err(io_error)?;
-            let (actual, stamp) = inspect_open(&mut copy)?;
-            // Exact readback equality preserves the validated source without
-            // allocating and validating another full snapshot.
-            if actual.as_slice() != bytes.as_slice() {
-                return Err("還原前副本讀回核對失敗。".into());
-            }
-            Ok(stamp)
-        })();
-        let stamp = match verified {
-            Ok(stamp) => stamp,
-            Err(error) => {
-                let cleanup = platform::delete_open(&copy);
-                return Err(format!(
-                    "無法完成還原前副本，未取代目前資料：{error}{}",
-                    cleanup
-                        .err()
-                        .map(|error| format!("\n副本尚未移除：{}（{error}）", path.display()))
-                        .unwrap_or_default()
-                ));
-            }
-        };
-        self.restore_copy = Some((
-            expected,
-            OwnedFile {
-                path: path.clone(),
-                stamp,
-            },
-        ));
-        Ok(Some((copy, path)))
+    /// The backup reader checked the records and the preview checked the target vault ID.
+    pub fn restore_from_preview(
+        &mut self,
+        candidate: &VaultSnapshot,
+    ) -> Result<CommitOutcome, String> {
+        let revision = self.validate_candidate(candidate, true)?;
+        self.commit_validated(candidate, revision)
     }
 
     /// Candidate uses the last committed revision. This method owns revision advancement.
     pub fn commit(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
-        self.validate_candidate(candidate)?;
-        self.commit_validated(candidate)
+        let revision = self.validate_candidate(candidate, false)?;
+        self.commit_validated(candidate, revision)
     }
 
-    fn validate_candidate(&self, candidate: &VaultSnapshot) -> Result<(), String> {
+    /// Save an edit whose changed records, groups and ordering were checked
+    /// against the acknowledged vault by the operation that prepared it.
+    pub fn commit_edit(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
+        let revision = self.validate_candidate(candidate, self.current.is_some())?;
+        self.commit_validated(candidate, revision)
+    }
+
+    fn validate_candidate(
+        &mut self,
+        candidate: &VaultSnapshot,
+        contents_checked: bool,
+    ) -> Result<u64, String> {
         if self.blocked {
-            return Err("資料檔狀態需要檢查，已停止保存。請保留檔案並重新開啟 BNAuth。".into());
+            return Err(ErrorCode::WriteFailed
+                .with_detail("資料檔狀態需要檢查。請保留檔案並重新開啟 BNAuth。")
+                .to_string());
         }
         if !self.cleanup_pending.is_empty() {
             return Err(
-                "上次保存留下的暫存檔尚未移除，請先按「重試移除暫存檔」；目前未再次保存資料。"
-                    .into(),
+                ErrorCode::DeleteFailed
+                    .with_detail("上次保存留下的暫存檔尚未移除，請先按「清理暫存檔」。")
+                    .to_string(),
             );
         }
-        candidate.validate()?;
+        self.primary_read_only = primary_is_read_only(self.primary_guard.as_ref())?;
+        if self.is_read_only() {
+            return Err(ErrorCode::PermissionDenied.notice().to_string());
+        }
+        if contents_checked {
+            candidate.validate_edit_metadata()?;
+        } else {
+            candidate.validate()?;
+        }
         match &self.current {
             Some(old) => {
-                if candidate.vault_id != old.vault_id
-                    || candidate.revision != old.revision
-                    || candidate.created_at_ms != old.created_at_ms
-                {
+                if candidate.vault_id != old.vault_id || candidate.revision != old.revision {
                     return Err("目前資料與上次讀取的資料檔不符，請重新讀取後再操作。".into());
                 }
             }
@@ -327,20 +382,19 @@ impl Repository {
         candidate
             .revision
             .checked_add(1)
-            .ok_or("資料檔的保存次數已達上限，無法繼續保存。")?;
-        Ok(())
+            .ok_or_else(|| "資料檔的保存次數已達上限，無法繼續保存。".into())
     }
 
-    fn commit_validated(&mut self, candidate: &VaultSnapshot) -> Result<CommitOutcome, String> {
-        self.check_current()?;
-        let mut next = candidate.clone();
-        next.revision = candidate
-            .revision
-            .checked_add(1)
-            .ok_or("資料檔的保存次數已達上限，無法繼續保存。")?;
-        next.updated_at_ms = now_ms().max(next.updated_at_ms).max(next.created_at_ms);
+    fn commit_validated(
+        &mut self,
+        candidate: &VaultSnapshot,
+        revision: u64,
+    ) -> Result<CommitOutcome, String> {
+        // The existing primary stays locked against writes and replacement while staging.
+        self.check_current(PrimaryCheck::Identity)?;
+        let mut next = candidate.file_view();
+        next.revision = revision;
         let encoded = native::encode_validated(&next)?;
-        let expected: [u8; 32] = Sha256::digest(&*encoded).into();
         let transaction = Uuid::new_v4();
         let temp = self
             .canonical_parent
@@ -348,14 +402,14 @@ impl Repository {
         let rollback = self
             .canonical_parent
             .join(format!(".BNAuth.bnauth.{transaction}.rollback"));
-        let previous = self.fingerprint;
-        let mut staged: Option<OwnedFile> = None;
+        let previous = self.current.map(|primary| primary.stamp);
+        let mut staged: Option<(OwnedFile, File)> = None;
 
         let stage_result = (|| -> Result<(), String> {
             self.inject(FaultPoint::BeforeWrite)?;
             #[cfg(test)]
             if self.fault == Some(Fault::TempAlreadyExists) {
-                fs::write(&temp, b"external pre-existing temp").map_err(io_error)?;
+                fs::write(&temp, b"external pre-existing temp").map_err(write_io_error)?;
             }
             let create_result = {
                 #[cfg(test)]
@@ -370,13 +424,14 @@ impl Repository {
             let mut file = create_result.map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     self.blocked = true;
-                    format!(
-                        "{}\n下列暫存檔不是本次保存建立的，已保留，不會刪除：{}",
-                        io_error(error),
-                        temp.display()
-                    )
+                    ErrorCode::WriteFailed
+                        .with_detail(format!(
+                            "下列暫存檔由其他程式建立，已保留在原位置：{}",
+                            temp.display()
+                        ))
+                        .to_string()
                 } else {
-                    format!("無法建立保存所需的暫存檔。\n詳細原因：{error}")
+                    write_io_error(error)
                 }
             })?;
             let write_result = (|| -> Result<(), String> {
@@ -386,44 +441,43 @@ impl Repository {
                     Some(Fault::PartialWrite | Fault::PartialWriteAndCleanup)
                 ) {
                     file.write_all(&encoded[..encoded.len() / 2])
-                        .map_err(io_error)?;
-                    return Err("模擬部分寫入失敗。".into());
+                        .map_err(write_io_error)?;
+                    return Err(ErrorCode::WriteFailed.notice().to_string());
                 }
-                file.write_all(&encoded).map_err(io_error)?;
+                file.write_all(&encoded).map_err(write_io_error)?;
                 self.inject(FaultPoint::BeforeFlush)?;
-                file.sync_all().map_err(io_error)
+                file.sync_all().map_err(write_io_error)
             })();
-            // Capture even partial bytes while our original creation handle still
-            // excludes outside writers. Never infer ownership from a filename.
-            let (_, stamp) = inspect_open(&mut file).map_err(|error| {
-                self.blocked = true;
-                format!(
-                    "{error}\n無法確認本次保存的暫存檔狀態，請保留檔案以供檢查：{}",
-                    temp.display()
-                )
-            })?;
-            staged = Some(OwnedFile {
-                path: temp.clone(),
-                stamp,
-            });
-            drop(file);
-            write_result?;
-            // The expected hash identifies the encoded, validated candidate.
-            if stamp.hash != expected {
-                return Err("尚未保存：暫存檔內容與預期不符。".into());
+            // The original creation handle owns even a partial write. Only read
+            // a failed write if cleanup fails and we will need its stamp to retry.
+            if let Err(reason) = write_result {
+                let failed = self.inject(FaultPoint::Cleanup).is_err();
+                let Err(error) = delete_verified(&file, failed) else {
+                    return Err(reason);
+                };
+                let (owned, _) = self.inspect_stage(&mut file, &temp, None)?;
+                self.retain_for_cleanup(&owned, error);
+                return Err(reason);
+            }
+            let (owned, matches) = self.inspect_stage(&mut file, &temp, Some(&encoded))?;
+            staged = Some((owned, file));
+            if !matches {
+                return Err(ErrorCode::WriteFailed.notice().to_string());
             }
             self.inject(FaultPoint::AfterStage)?;
-            self.check_current()?;
+            self.check_current(PrimaryCheck::Fingerprint)?;
             self.inject(FaultPoint::BeforeReplace)?;
             Ok(())
         })();
+        drop(encoded);
         if let Err(error) = stage_result {
-            return Err(match &staged {
-                Some(owned) => self.discard_uncommitted(owned, error),
+            return Err(match staged {
+                Some((owned, file)) => self.discard_uncommitted(&owned, Some(file), error),
                 None => error,
             });
         }
-        let staged = staged.expect("successful stage owns its created file");
+        let (staged, file) = staged.expect("successful stage owns its created file");
+        drop(file);
         // ReplaceFileW needs DELETE access even in this process. Keep the main
         // guard throughout staging, then release it only for the atomic install.
         drop(self.primary_guard.take());
@@ -431,22 +485,41 @@ impl Repository {
         // Verification and the new lifetime guard are the same open handle;
         // there is no verified-but-unlocked success state to acknowledge.
         let opened = if self.inject(FaultPoint::ReadBack).is_ok() {
-            self.inject(FaultPoint::ReacquirePrimary)
-                .and_then(|()| open_primary(&self.path))
+            self.inject(FaultPoint::ReacquirePrimary).and_then(|()| {
+                read_primary(&self.path, false, |bytes, stamp| {
+                    if stamp == staged.stamp {
+                        native::verify_written(bytes, candidate, revision)
+                    } else if Some(stamp) == previous {
+                        // This handle guards exactly the previously validated bytes.
+                        Ok(())
+                    } else {
+                        native::decode(bytes).map(drop)
+                    }
+                })
+            })
         } else {
             Ok(None)
         };
-        let verified = match opened {
-            Ok(Some(opened)) if opened.stamp == staged.stamp && opened.snapshot == next => {
+        let verified_primary = match opened {
+            Ok(Some(opened)) if opened.stamp == staged.stamp => {
                 self.primary_guard = Some(opened.file);
-                true
+                let mut saved = candidate.clone();
+                saved.revision = revision;
+                Some((saved, opened.stamp))
             }
-            Ok(_) => false,
+            Ok(Some(opened)) if previous == Some(opened.stamp) => {
+                // Replace was refused and the complete readback found the
+                // acknowledged original. Keep this guard through failure cleanup.
+                self.primary_guard = Some(opened.file);
+                None
+            }
+            Ok(_) => None,
             Err(error) => {
                 return self.block_for_recovery(
                     &temp,
                     &rollback,
-                    &format!("更新資料檔後，無法確認內容或恢復檔案保護：{error}"),
+                    verification_error_code(&error),
+                    "無法讀回設定檔核對或恢復檔案保護。",
                 );
             }
         };
@@ -455,85 +528,136 @@ impl Repository {
             stamp,
         });
         let mut rollback_verified = previous.is_none();
+        let mut rollback_handle = None;
         if let Some(old_stamp) = previous {
-            match read_stamp_locked(&rollback) {
+            // Keep the verified rollback locked for cleanup. A reader can deny
+            // DELETE while still allowing verification of the completed save.
+            let mut can_delete = true;
+            let file = platform::open_guarded(&rollback, true).or_else(|_| {
+                can_delete = false;
+                platform::open_guarded(&rollback, false)
+            });
+            let stamp = file.and_then(|file| {
+                file.map(|mut file| {
+                    let stamp = stamp_open(&mut file);
+                    rollback_handle = Some(RollbackGuard { file, can_delete });
+                    stamp
+                })
+                .transpose()
+            });
+            match stamp {
                 Ok(Some(stamp)) if stamp == old_stamp => rollback_verified = true,
                 Ok(None) => (),
-                _ => return self.block_for_recovery(&temp, &rollback,
-                    "保存期間原資料檔被外部修改，或無法確認原資料備份是否完整；已保留所有檔案，沒有刪除原資料備份。"),
+                result => {
+                    let code = result.as_ref().err().map_or(ErrorCode::WriteFailed, |error| {
+                        verification_error_code(error)
+                    });
+                    return self.block_for_recovery(
+                        &temp,
+                        &rollback,
+                        code,
+                        "保存期間原資料檔被外部修改，或無法確認原資料備份是否完整；已保留所有檔案，沒有刪除原資料備份。",
+                    );
+                }
             }
         }
         // API status alone is insufficient. The held, verified candidate and
         // verified previous-file rollback are the commit point.
-        if verified {
+        if let Some((snapshot, stamp)) = verified_primary {
             if !rollback_verified {
                 return self.block_for_recovery(
                     &temp,
                     &rollback,
+                    ErrorCode::WriteFailed,
                     "新的資料檔已寫入，但找不到原資料備份，無法確認保存期間是否有外部修改。",
                 );
             }
-            self.current = Some(next.clone());
-            self.fingerprint = Some(staged.stamp);
-            let mut warnings = Vec::new();
-            if let Err(error) = replace_result {
-                warnings.push(format!(
-                    "資料已保存，但保存過程曾發生異常。\n詳細原因：{error}"
-                ));
-            }
-            for owned in std::iter::once(&staged).chain(rollback_owned.iter()) {
-                if let Err(error) = self.cleanup(owned) {
-                    warnings.push(format!(
-                        "資料已保存，部分暫存檔尚未移除。\n詳細原因：{error}"
-                    ));
-                }
-                if self.blocked {
-                    break;
-                }
-            }
-            return Ok(CommitOutcome {
-                snapshot: next,
-                warning: (!warnings.is_empty()).then(|| warnings.join("\n")),
-            });
+            self.current = Some(AcknowledgedPrimary::new(&snapshot, stamp));
+            // The installed primary has the staged file's verified identity and
+            // single link. Its former .tmp name cannot still refer to that file.
+            // Ordinary deletion failures can wait for the next successful open.
+            let warning = if let Some(owned) = &rollback_owned
+                && let Err(error) = self.remove_transaction_file(
+                    owned,
+                    rollback_handle.and_then(RollbackGuard::into_delete_handle),
+                )
+                && error.changed.is_some()
+            {
+                let detail = self.retain_for_cleanup(owned, error);
+                Some(format!("資料已保存，但暫存檔已變動。\n詳細原因：{detail}"))
+            } else {
+                None
+            };
+            return Ok(CommitOutcome { snapshot, warning });
         }
         let reason = replace_result
             .err()
-            .unwrap_or_else(|| "更新資料檔後，無法確認內容是否正確。".into());
-        self.recover_failed_commit(&staged, rollback_owned.as_ref(), &rollback, reason)
+            .unwrap_or_else(|| ErrorCode::WriteFailed.notice().to_string());
+        let displaced = if self.primary_guard.is_none() {
+            self.recover_failed_commit(&staged, &mut rollback_handle, &rollback, &reason)?
+        } else {
+            None
+        };
+        let mut error = reason;
+        for (owned, file) in std::iter::once((&staged, None))
+            .chain(
+                rollback_owned
+                    .as_ref()
+                    .zip(rollback_handle)
+                    .map(|(owned, guard)| (owned, guard.into_delete_handle())),
+            )
+            .chain(displaced.as_ref().map(|owned| (owned, None)))
+        {
+            error = self.discard_uncommitted(owned, file, error);
+            if self.blocked {
+                break;
+            }
+        }
+        Err(error)
     }
 
     pub fn retry_cleanup(&mut self) -> Result<(), String> {
         if self.blocked {
-            return Err(
-                "檔案已被外部修改或狀態無法確認，已停止移除暫存檔；請保留檔案以供檢查。".into(),
-            );
+            return Err(ErrorCode::DeleteFailed
+                .with_detail("檔案已被外部修改或狀態無法確認。請保留檔案以供檢查。")
+                .to_string());
         }
         let pending = std::mem::take(&mut self.cleanup_pending);
-        let mut errors = Vec::new();
+        let mut failures = Vec::new();
+        let mut blocked_error = None;
         for owned in pending {
             if self.blocked {
                 self.cleanup_pending.push(owned);
                 continue;
             }
-            if let Err(error) = self.cleanup(&owned) {
-                errors.push(error);
+            if let Err(error) = self.remove_transaction_file(&owned, None) {
+                if error.changed.is_some() {
+                    blocked_error = Some(self.retain_for_cleanup(&owned, error));
+                } else {
+                    failures.push((error.code, owned.path.clone()));
+                    self.cleanup_pending.push(owned);
+                }
             }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "部分暫存檔仍無法移除。\n詳細原因：\n{}",
-                errors.join("\n")
-            ))
+        if let Some(error) = blocked_error {
+            return Err(error);
         }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let display_directory = if self.check_current_directory().is_ok() {
+            &self.original_parent
+        } else {
+            &self.canonical_parent
+        };
+        cleanup_failures(failures, display_directory)
     }
 
     fn reacquire_current(&mut self) -> Result<(), String> {
         self.inject(FaultPoint::ReacquirePrimary)?;
-        match (self.fingerprint, open_primary(&self.path)?) {
+        match (self.current, open_primary(&self.path, false)?) {
             (Some(expected), Some(opened))
-                if opened.stamp == expected && Some(&opened.snapshot) == self.current.as_ref() =>
+                if AcknowledgedPrimary::new(&opened.decoded, opened.stamp) == expected =>
             {
                 self.primary_guard = Some(opened.file);
                 Ok(())
@@ -543,46 +667,62 @@ impl Repository {
         }
     }
 
-    fn check_current(&self) -> Result<(), String> {
-        if platform::canonical_ntfs_directory(&self.original_parent)? != self.canonical_parent {
+    fn check_current_directory(&self) -> Result<(), String> {
+        if platform::canonical_directory(&self.original_parent)? != self.canonical_parent {
             return Err("資料檔所在的資料夾已變更，已停止保存。".into());
         }
-        // The expected fingerprint belongs to already decoded, validated bytes.
-        // Matching identity and hash proves those same bytes are still present.
-        match (self.fingerprint, read_stamp_locked(&self.path)?) {
-            (Some(expected), Some(stamp)) if stamp == expected => Ok(()),
-            (None, None) => Ok(()),
+        Ok(())
+    }
+
+    fn check_current(&self, check: PrimaryCheck) -> Result<(), String> {
+        self.check_current_directory()?;
+        let matches = match (self.current, platform::open_guarded(&self.path, false)?) {
+            (Some(expected), Some(mut file)) => match check {
+                PrimaryCheck::Identity => {
+                    platform::file_identity(&file)? == expected.stamp.identity
+                }
+                PrimaryCheck::Fingerprint => stamp_open(&mut file)? == expected.stamp,
+            },
+            (None, None) => true,
             (None, Some(_)) => {
-                Err("資料檔已由其他程式建立，已停止保存；請重新開啟 BNAuth。".into())
+                return Err("資料檔已由其他程式建立，已停止保存；請重新開啟 BNAuth。".into());
             }
-            _ => Err("資料檔已被其他程式修改，已停止保存；請重新開啟 BNAuth。".into()),
+            (Some(_), None) => false,
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err("資料檔已被其他程式修改，已停止保存；請重新開啟 BNAuth。".into())
         }
     }
     fn install(&self, temp: &Path, rollback: &Path) -> Result<(), String> {
         #[cfg(test)]
         match self.fault {
-            Some(Fault::Replace1176) => return Err("模擬Win32錯誤1176。".into()),
+            Some(Fault::Replace1176) => {
+                return Err(write_io_error(std::io::Error::from_raw_os_error(1176)));
+            }
             Some(Fault::Replace1177) => {
                 platform::move_no_replace(&self.path, rollback)?;
-                return Err("模擬Win32錯誤1177。".into());
+                return Err(write_io_error(std::io::Error::from_raw_os_error(1177)));
             }
             Some(Fault::ExternalChangeBeforeReplace) => {
-                let mut external = self.current.as_ref().unwrap().clone();
+                let mut external = native::read(&self.path)?.0;
                 external.revision += 1;
+                let sort_order = external.groups.len() as u32;
                 external.groups.push(bnauth_core::Group {
                     id: Uuid::new_v4(),
                     name: "外部修改".into(),
-                    sort_order: external.groups.len() as u32,
+                    sort_order,
                     is_ungrouped: false,
                 });
-                fs::write(&self.path, &*native::encode(&external)?).map_err(io_error)?;
+                fs::write(&self.path, &*native::encode(&external)?).map_err(write_io_error)?;
             }
             Some(Fault::ExternalReformatBeforeReplace) => {
-                let compact = serde_json::to_vec(self.current.as_ref().unwrap()).unwrap();
-                fs::write(&self.path, compact).map_err(io_error)?;
+                let compact = serde_json::to_vec(&native::read(&self.path)?.0).unwrap();
+                fs::write(&self.path, compact).map_err(write_io_error)?;
             }
             Some(Fault::ExternalFirstCreate) => {
-                fs::write(&self.path, b"external first-create content").map_err(io_error)?;
+                fs::write(&self.path, b"external first-create content").map_err(write_io_error)?;
             }
             _ => (),
         }
@@ -593,72 +733,119 @@ impl Repository {
         }
     }
 
-    fn cleanup(&mut self, owned: &OwnedFile) -> Result<(), String> {
+    fn remove_transaction_file(
+        &self,
+        owned: &OwnedFile,
+        verified_file: Option<File>,
+    ) -> Result<(), CleanupFailure> {
         #[cfg(test)]
         if self.fault == Some(Fault::ExternalChangeBeforeCleanup)
             && owned.path.extension().is_some_and(|s| s == "rollback")
         {
-            fs::write(&owned.path, b"external cleanup content").map_err(io_error)?;
+            assert!(fs::write(&owned.path, b"external cleanup content").is_err());
         }
-        let result = delete_owned(owned, self.inject(FaultPoint::Cleanup).is_err());
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.blocked |= error.changed;
-                self.cleanup_pending.push(owned.clone());
-                Err(format!("{}\n{}", error.message, owned.path.display()))
-            }
+        let inject_failure = self.inject(FaultPoint::Cleanup).is_err();
+        match verified_file {
+            Some(file) => delete_verified(&file, inject_failure),
+            None => delete_owned(owned, inject_failure),
         }
     }
-    fn discard_uncommitted(&mut self, owned: &OwnedFile, reason: String) -> String {
-        match self.cleanup(owned) {
+    fn cleanup(&mut self, owned: &OwnedFile, verified_file: Option<File>) -> Result<(), String> {
+        self.remove_transaction_file(owned, verified_file)
+            .map_err(|error| self.retain_for_cleanup(owned, error))
+    }
+    fn inspect_stage(
+        &mut self,
+        file: &mut File,
+        path: &Path,
+        expected: Option<&[u8]>,
+    ) -> Result<(OwnedFile, bool), String> {
+        let (stamp, matches) = stamp_and_compare(file, expected).map_err(|error| {
+            self.blocked = true;
+            if ErrorCode::FileTooLarge.matches_message(&error) {
+                error
+            } else {
+                ErrorCode::WriteFailed
+                    .with_detail(format!(
+                        "無法確認本次保存的暫存檔狀態，請保留檔案以供檢查：{}",
+                        path.display()
+                    ))
+                    .to_string()
+            }
+        })?;
+        Ok((
+            OwnedFile {
+                path: path.to_owned(),
+                stamp,
+            },
+            matches,
+        ))
+    }
+    fn retain_for_cleanup(&mut self, owned: &OwnedFile, error: CleanupFailure) -> String {
+        self.blocked |= error.changed.is_some();
+        self.cleanup_pending.push(owned.clone());
+        match error.changed {
+            Some(detail) => error.code.with_detail(detail).to_string(),
+            None => error.code.notice().to_string(),
+        }
+    }
+    fn discard_uncommitted(
+        &mut self,
+        owned: &OwnedFile,
+        verified_file: Option<File>,
+        reason: String,
+    ) -> String {
+        match self.cleanup(owned, verified_file) {
             Ok(()) => reason,
-            Err(error) => {
-                format!("{reason}\n這次變更尚未保存，部分暫存檔尚未移除。\n詳細原因：{error}")
-            }
+            Err(error) if self.blocked && reason != ErrorCode::DiskFull.notice().to_string() => error,
+            Err(_) => reason,
         }
     }
-    fn block_for_recovery(
+    fn block_for_recovery<T>(
         &mut self,
         temp: &Path,
         rollback: &Path,
+        code: ErrorCode,
         reason: &str,
-    ) -> Result<CommitOutcome, String> {
+    ) -> Result<T, String> {
         self.blocked = true;
-        Err(format!(
-            "{reason}\n無法確認這次保存的結果，已停止保存。請保留以下位置的檔案，不要刪除或覆蓋：\n{}\n{}\n{}\n{}",
-            self.path.display(),
-            temp.display(),
-            rollback.display(),
-            rollback.with_extension("recovery").display()
-        ))
+        if matches!(code, ErrorCode::DiskFull | ErrorCode::FileTooLarge) {
+            return Err(code.notice().to_string());
+        }
+        Err(code
+            .with_detail(format!(
+                "{reason}\n請保留下列位置的檔案供檢查：\n{}\n{}\n{}\n{}",
+                self.path.display(),
+                temp.display(),
+                rollback.display(),
+                rollback.with_extension("recovery").display()
+            ))
+            .to_string())
     }
     fn recover_failed_commit(
         &mut self,
         staged: &OwnedFile,
-        rollback: Option<&OwnedFile>,
+        rollback: &mut Option<RollbackGuard>,
         rollback_path: &Path,
-        reason: String,
-    ) -> Result<CommitOutcome, String> {
-        // Recovery may rename/delete the attempted primary. Never let our own
-        // deny-delete guard obstruct restoring the acknowledged old snapshot.
-        drop(self.primary_guard.take());
+        reason: &str,
+    ) -> Result<Option<OwnedFile>, String> {
+        debug_assert!(self.primary_guard.is_none());
         // Expected stamps identify already validated bytes. Reacquiring the
         // acknowledged primary below still validates its full contents and guard.
         let actual = read_stamp_locked(&self.path);
         let actual_stamp = actual.as_ref().ok().copied().flatten();
         let main_missing = matches!(actual, Ok(None));
-        let rollback_stamp = read_stamp_locked(rollback_path).ok().flatten();
         let mut displaced: Option<OwnedFile> = None;
-        let restored = match self.fingerprint {
+        let restored = match self.current.map(|primary| primary.stamp) {
             Some(old_stamp) if actual_stamp == Some(old_stamp) => true,
-            Some(old_stamp) if rollback_stamp == Some(old_stamp) => {
+            Some(_) if rollback.is_some() => {
                 let can_restore = if main_missing {
                     true
                 } else if actual_stamp == Some(staged.stamp) {
                     #[cfg(test)]
                     if self.fault == Some(Fault::ExternalChangeBeforeRecovery) {
-                        fs::write(&self.path, b"external recovery content").map_err(io_error)?;
+                        fs::write(&self.path, b"external recovery content")
+                            .map_err(write_io_error)?;
                     }
                     // Never overwrite a name after only checking its old bytes.
                     // Isolate whichever file currently occupies it without deleting
@@ -677,18 +864,18 @@ impl Repository {
                 } else {
                     false
                 };
-                can_restore
-                    && platform::move_no_replace(rollback_path, &self.path).is_ok()
-                    && read_stamp_locked(&self.path)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|stamp| stamp == old_stamp)
+                // reacquire_current verifies the restored identity and contents
+                // under the same handle that will guard the next save.
+                can_restore && {
+                    drop(rollback.take());
+                    platform::move_no_replace(rollback_path, &self.path).is_ok()
+                }
             }
             None if main_missing => true,
             None if actual_stamp == Some(staged.stamp) => {
                 #[cfg(test)]
                 if self.fault == Some(Fault::ExternalChangeBeforeRecovery) {
-                    fs::write(&self.path, b"external recovery content").map_err(io_error)?;
+                    fs::write(&self.path, b"external recovery content").map_err(write_io_error)?;
                 }
                 delete_owned(
                     &OwnedFile {
@@ -701,31 +888,22 @@ impl Repository {
             }
             _ => false,
         };
-        if !restored {
-            return self.block_for_recovery(
-                &staged.path,
-                rollback_path,
-                &format!("{reason}\n無法確認原資料是否已恢復，已停止保存。"),
-            );
-        }
-        if let Err(error) = self.reacquire_current() {
-            return self.block_for_recovery(
-                &staged.path,
-                rollback_path,
-                &format!("{reason}\n原資料已恢復，但無法確認內容或恢復檔案保護：{error}"),
-            );
-        }
-        let mut error = format!("{reason}\n這次變更尚未保存，原有資料已確認保留，可重試保存。");
-        for owned in std::iter::once(staged)
-            .chain(rollback)
-            .chain(displaced.as_ref())
-        {
-            error = self.discard_uncommitted(owned, error);
-            if self.blocked {
-                break;
-            }
-        }
-        Err(error)
+        let detail = if !restored {
+            "無法確認原資料是否已恢復，已停止保存。"
+        } else if self.reacquire_current().is_err() {
+            "原資料已恢復，但無法確認內容或恢復檔案保護。"
+        } else {
+            return Ok(displaced);
+        };
+        let code = [
+            ErrorCode::PermissionDenied,
+            ErrorCode::FileInUse,
+            ErrorCode::DiskFull,
+        ]
+        .into_iter()
+        .find(|code| code.matches_message(reason))
+        .unwrap_or(ErrorCode::WriteFailed);
+        self.block_for_recovery(&staged.path, rollback_path, code, detail)
     }
     fn inject(&self, point: FaultPoint) -> Result<(), String> {
         #[cfg(test)]
@@ -736,24 +914,164 @@ impl Repository {
             || (matches!(point, FaultPoint::ReadBack | FaultPoint::ReacquirePrimary)
                 && self.fault == Some(Fault::ReadBackAndReacquire))
         {
-            return Err(format!("模擬保存故障：{point:?}"));
+            return Err(ErrorCode::WriteFailed.notice().to_string());
         }
         let _ = point;
         Ok(())
     }
 }
-fn io_error(error: std::io::Error) -> String {
-    format!("檔案操作失敗（{error}）。")
+fn write_io_error(error: std::io::Error) -> String {
+    operation_io_error(&error, ErrorCode::WriteFailed).notice().to_string()
 }
+
+fn verification_error_code(error: &str) -> ErrorCode {
+    if ErrorCode::FileTooLarge.matches_message(error) {
+        ErrorCode::FileTooLarge
+    } else {
+        ErrorCode::WriteFailed
+    }
+}
+
+fn primary_io_error(error: std::io::Error) -> String {
+    operation_io_error(&error, ErrorCode::ReadFailed).notice().to_string()
+}
+
+fn cleanup_io_error(error: std::io::Error) -> CleanupFailure {
+    CleanupFailure::retry(temp_cleanup_error(&error))
+}
+
+fn recover_startup_primary(
+    primary: &Path,
+    remnants: &[PathBuf],
+    read_only: bool,
+) -> Result<Option<OpenedPrimary<VaultSnapshot>>, String> {
+    let mut best: Option<(_, OpenedPrimary<VaultSnapshot>)> = None;
+    let mut failure = None;
+    let in_use = ErrorCode::FileInUse.notice().to_string();
+    for path in remnants {
+        let extension = path.extension().expect("recognized remnant extension");
+        let rollback = extension.eq_ignore_ascii_case("rollback");
+        if !rollback && !extension.eq_ignore_ascii_case("recovery") {
+            continue;
+        }
+        match open_primary(path, !read_only) {
+            Ok(Some(opened)) => {
+                let priority = (opened.decoded.revision, rollback, path);
+                if best
+                    .as_ref()
+                    .is_none_or(|(previous, _)| priority > *previous)
+                {
+                    best = Some((priority, opened));
+                }
+            }
+            Ok(None) => (),
+            Err(error) if failure.is_none() || error == in_use => failure = Some(error),
+            Err(_) => (),
+        }
+    }
+    let Some((_, opened)) = best else {
+        return failure.map_or(Ok(None), Err);
+    };
+    if read_only {
+        return Ok(Some(opened));
+    }
+    // Install the verified source by handle, then reacquire the usual main
+    // guard and verify the bytes before acknowledging the recovered snapshot.
+    crate::export_file::rename_open_file_without_replace(&opened.file, primary)
+        .map_err(primary_io_error)?;
+    let OpenedPrimary {
+        file,
+        decoded,
+        stamp,
+    } = opened;
+    drop(file);
+    let changed = "資料檔已被其他程式修改，已停止保存；請重新開啟 BNAuth。";
+    let mut file = platform::open_guarded(primary, false)?.ok_or(changed)?;
+    if stamp_open(&mut file)? != stamp {
+        return Err(changed.into());
+    }
+    Ok(Some(OpenedPrimary {
+        file,
+        decoded,
+        stamp,
+    }))
+}
+
+fn clean_startup_remnants(
+    remnants: &[PathBuf],
+    display_directory: &Path,
+    write_access_denied: bool,
+    primary_readable: bool,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for path in remnants {
+        let extension = path.extension().expect("recognized remnant extension");
+        if extension.eq_ignore_ascii_case("cleanup") {
+            let _ = platform::delete_startup_remnant(path);
+            continue;
+        }
+        if extension.eq_ignore_ascii_case("tmp") || primary_readable {
+            match platform::delete_startup_remnant(path) {
+                Ok(()) => (),
+                Err(_) if write_access_denied => (), // Allow read-only browsing.
+                Err(error) => {
+                    failures.push((temp_cleanup_error(&error), path.clone()));
+                }
+            }
+        }
+    }
+    cleanup_failures(failures, display_directory)
+}
+
+fn cleanup_failures(
+    failures: Vec<(ErrorCode, PathBuf)>,
+    display_directory: &Path,
+) -> Result<(), String> {
+    let mut grouped: Vec<(ErrorCode, Vec<String>)> = Vec::new();
+    for (code, path) in failures {
+        let path = display_directory
+            .join(path.file_name().expect("transaction file name"))
+            .display()
+            .to_string();
+        if let Some((_, paths)) = grouped.iter_mut().find(|(other, _)| *other == code) {
+            paths.push(path);
+        } else {
+            grouped.push((code, vec![path]));
+        }
+    }
+    let messages: Vec<_> = grouped
+        .into_iter()
+        .map(|(code, paths)| match code {
+            ErrorCode::FileInUse => code.manual_delete(paths.join("\n")).to_string(),
+            _ => code.notice().to_string(),
+        })
+        .collect();
+    if messages.is_empty() {
+        Ok(())
+    } else {
+        Err(messages.join("\n\n"))
+    }
+}
+
 fn find_remnants(parent: &Path) -> Result<Vec<PathBuf>, String> {
+    const PREFIX: &[u8] = b".BNAuth.bnauth.";
     let mut result = vec![];
-    for entry in fs::read_dir(parent).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .to_lowercase()
-            .starts_with(".bnauth.bnauth.")
+    for entry in fs::read_dir(parent).map_err(primary_io_error)? {
+        let entry = entry.map_err(primary_io_error)?;
+        let name = entry.file_name();
+        let Some((prefix, tail)) = name.as_encoded_bytes().split_at_checked(PREFIX.len()) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(PREFIX) {
+            continue;
+        }
+        let Some((id, extension)) = tail.split_at_checked(uuid::fmt::Hyphenated::LENGTH) else {
+            continue;
+        };
+        if [b".tmp".as_slice(), b".rollback", b".recovery", b".cleanup"]
+            .into_iter()
+            .any(|suffix| extension.eq_ignore_ascii_case(suffix))
+            && Uuid::try_parse_ascii(id).is_ok()
         {
             result.push(entry.path());
         }
@@ -762,8 +1080,6 @@ fn find_remnants(parent: &Path) -> Result<Vec<PathBuf>, String> {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaultPoint {
-    BeforeRestoreCopy,
-    RestoreCopyFlush,
     BeforeWrite,
     BeforeFlush,
     AfterStage,
@@ -806,11 +1122,14 @@ mod platform {
     };
     use windows_sys::Win32::{
         Foundation::{
-            CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-            WAIT_ABANDONED, WAIT_OBJECT_0,
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+            WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Storage::FileSystem::*,
-        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+        System::{
+            SystemServices::FILE_READ_ONLY_VOLUME,
+            Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+        },
     };
 
     fn wide(value: &OsStr) -> Result<Vec<u16>, String> {
@@ -821,10 +1140,11 @@ mod platform {
         value.push(0);
         Ok(value)
     }
-    fn last_error(action: &str) -> String {
-        format!("{action}失敗（Windows 錯誤碼 {}）。", unsafe {
-            GetLastError()
-        })
+    fn last_read_error() -> String {
+        primary_io_error(std::io::Error::last_os_error())
+    }
+    fn last_write_error() -> String {
+        write_io_error(std::io::Error::last_os_error())
     }
     struct Handle(HANDLE);
     impl Drop for Handle {
@@ -848,20 +1168,26 @@ mod platform {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            Err(last_error("讀取檔案資訊"))
+            Err(last_read_error())
         } else {
             Ok(Handle(handle))
         }
     }
-    pub fn canonical_ntfs_directory(path: &Path) -> Result<PathBuf, String> {
+    fn open_directory(path: &Path) -> Result<Handle, String> {
         let handle = open_attributes(path, FILE_FLAG_BACKUP_SEMANTICS)?;
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0
-            || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        {
-            return Err("資料檔所在的資料夾無法使用。".into());
+        if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+            return Err(last_read_error());
         }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(ErrorCode::ReadFailed.notice().to_string());
+        }
+        Ok(handle)
+    }
+    pub(super) fn canonical_ntfs_directory(path: &Path) -> Result<NtfsDirectory, String> {
+        let handle = open_directory(path)?;
         let mut fsname = [0u16; 32];
+        let mut volume_flags = 0;
         if unsafe {
             GetVolumeInformationByHandleW(
                 handle.0,
@@ -869,20 +1195,27 @@ mod platform {
                 0,
                 ptr::null_mut(),
                 ptr::null_mut(),
-                ptr::null_mut(),
+                &mut volume_flags,
                 fsname.as_mut_ptr(),
                 fsname.len() as u32,
             )
         } == 0
         {
-            return Err(last_error("確認磁碟格式"));
+            return Err(last_read_error());
         }
         let end = fsname.iter().position(|&v| v == 0).unwrap_or(fsname.len());
         if String::from_utf16_lossy(&fsname[..end]) != "NTFS" {
-            return Err(
-                "目前只支援在 NTFS 格式的磁碟保存，請將整個資料夾移到本機的 NTFS 磁碟。".into(),
-            );
+            return Err(ErrorCode::UnsupportedFilesystem.notice().to_string());
         }
+        Ok(NtfsDirectory {
+            path: volume_directory_path(&handle)?,
+            read_only_volume: volume_flags & FILE_READ_ONLY_VOLUME != 0,
+        })
+    }
+    pub(super) fn canonical_directory(path: &Path) -> Result<PathBuf, String> {
+        volume_directory_path(&open_directory(path)?)
+    }
+    fn volume_directory_path(handle: &Handle) -> Result<PathBuf, String> {
         let mut buffer = vec![0u16; 1024];
         loop {
             let length = unsafe {
@@ -894,7 +1227,7 @@ mod platform {
                 )
             };
             if length == 0 {
-                return Err(last_error("確認資料檔所在的資料夾"));
+                return Err(last_read_error());
             }
             if length as usize >= buffer.len() {
                 if length > 32768 {
@@ -907,6 +1240,28 @@ mod platform {
             return Ok(PathBuf::from(OsString::from_wide(&buffer)));
         }
     }
+    pub fn save_access_denied(directory: &Path, primary: &Path) -> bool {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_WRITE_PROTECT};
+
+        let denied = |path: &Path, access, flags| {
+            OpenOptions::new()
+                .read(true)
+                .access_mode(access)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(flags)
+                .open(path)
+                .is_err_and(|error| {
+                    matches!(
+                        error.raw_os_error().map(|code| code as u32),
+                        Some(ERROR_ACCESS_DENIED | ERROR_WRITE_PROTECT)
+                    )
+                })
+        };
+        // Stage a new file in the directory, then replace the existing primary. Opening for
+        // DELETE lets NTFS check both the file's DELETE and its parent's FILE_DELETE_CHILD.
+        denied(directory, FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS)
+            || denied(primary, DELETE, FILE_FLAG_OPEN_REPARSE_POINT)
+    }
     pub fn create_temp(path: &Path) -> std::io::Result<File> {
         OpenOptions::new()
             .read(true)
@@ -918,7 +1273,12 @@ mod platform {
             .open(path)
     }
     pub fn open_guarded(path: &Path, delete: bool) -> Result<Option<File>, String> {
-        let path = wide(path.as_os_str())?;
+        open_guarded_io(path, delete).map_err(primary_io_error)
+    }
+    pub(super) fn open_guarded_io(path: &Path, delete: bool) -> std::io::Result<Option<File>> {
+        open_guarded_wide(&wide(path.as_os_str()).map_err(std::io::Error::other)?, delete)
+    }
+    fn open_guarded_wide(path: &[u16], delete: bool) -> std::io::Result<Option<File>> {
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -935,7 +1295,7 @@ mod platform {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Ok(None)
             } else {
-                Err(io_error(error))
+                Err(error)
             }
         } else {
             // File owns this handle; no Handle wrapper may close it a second time.
@@ -945,7 +1305,7 @@ mod platform {
     pub fn file_identity(file: &File) -> Result<FileIdentity, String> {
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-            return Err(last_error("檢查資料檔"));
+            return Err(last_read_error());
         }
         if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
             return Err("資料檔必須是一般檔案，不能是資料夾或指向其他位置的連結。".into());
@@ -958,7 +1318,7 @@ mod platform {
             index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         })
     }
-    pub fn delete_open(file: &File) -> Result<(), String> {
+    pub fn delete_open(file: &File) -> std::io::Result<()> {
         let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
         if unsafe {
             SetFileInformationByHandle(
@@ -969,10 +1329,17 @@ mod platform {
             )
         } == 0
         {
-            Err(last_error("移除暫存檔"))
+            Err(std::io::Error::last_os_error())
         } else {
             Ok(())
         }
+    }
+    pub(super) fn delete_startup_remnant(path: &Path) -> std::io::Result<()> {
+        if let Some(file) = open_guarded_io(path, true)? {
+            file_identity(&file).map_err(std::io::Error::other)?;
+            delete_open(&file)?;
+        }
+        Ok(())
     }
     static HELD: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     pub struct Lock {
@@ -988,17 +1355,18 @@ mod platform {
                 .lock()
                 .map_err(|_| "無法確認資料檔是否已被開啟。")?;
             if held.contains(&name) {
-                return Err("此資料檔已在使用中，請關閉另一個 BNAuth 視窗。".into());
+                return Err(ErrorCode::FileInUse.notice().to_string());
             }
             let wide_name = wide(OsStr::new(&name))?;
             let handle = unsafe { CreateMutexW(ptr::null(), 0, wide_name.as_ptr()) };
             if handle.is_null() {
-                return Err(last_error("防止多個 BNAuth 同時修改資料檔"));
+                return Err(last_read_error());
             }
             let handle = Handle(handle);
-            let result = unsafe { WaitForSingleObject(handle.0, 0) };
-            if result != WAIT_OBJECT_0 && result != WAIT_ABANDONED {
-                return Err("此資料檔已在使用中，或無法防止其他程式修改，已停止保存。".into());
+            match unsafe { WaitForSingleObject(handle.0, 0) } {
+                WAIT_OBJECT_0 | WAIT_ABANDONED => {}
+                WAIT_TIMEOUT => return Err(ErrorCode::FileInUse.notice().to_string()),
+                _ => return Err(last_read_error()),
             }
             held.insert(name.clone());
             Ok(Self { handle, name })
@@ -1018,7 +1386,7 @@ mod platform {
         let source = wide(source.as_os_str())?;
         let target = wide(target.as_os_str())?;
         if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-            Err(last_error("建立或恢復資料檔"))
+            Err(last_write_error())
         } else {
             Ok(())
         }
@@ -1038,7 +1406,7 @@ mod platform {
             )
         } == 0
         {
-            Err(last_error("更新資料檔"))
+            Err(last_write_error())
         } else {
             Ok(())
         }
@@ -1049,8 +1417,14 @@ mod platform {
 mod platform {
     use super::*;
     pub struct Lock;
-    pub fn canonical_ntfs_directory(_: &Path) -> Result<PathBuf, String> {
-        Err("目前只支援在 Windows 的 NTFS 格式磁碟保存資料。".into())
+    pub(super) fn canonical_ntfs_directory(_: &Path) -> Result<NtfsDirectory, String> {
+        Err(ErrorCode::UnsupportedFilesystem.notice().to_string())
+    }
+    pub(super) fn canonical_directory(_: &Path) -> Result<PathBuf, String> {
+        Err("不支援的平台。".into())
+    }
+    pub fn save_access_denied(_: &Path, _: &Path) -> bool {
+        true
     }
     pub fn create_temp(_: &Path) -> std::io::Result<File> {
         Err(std::io::Error::other("不支援的平台。"))
@@ -1058,11 +1432,17 @@ mod platform {
     pub fn open_guarded(_: &Path, _: bool) -> Result<Option<File>, String> {
         Err("不支援的平台。".into())
     }
+    pub(super) fn open_guarded_io(_: &Path, _: bool) -> std::io::Result<Option<File>> {
+        Err(std::io::Error::other("不支援的平台。"))
+    }
     pub fn file_identity(_: &File) -> Result<FileIdentity, String> {
         Err("不支援的平台。".into())
     }
-    pub fn delete_open(_: &File) -> Result<(), String> {
-        Err("不支援的平台。".into())
+    pub fn delete_open(_: &File) -> std::io::Result<()> {
+        Err(std::io::Error::other("不支援的平台。"))
+    }
+    pub(super) fn delete_startup_remnant(_: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("不支援的平台。"))
     }
     impl Lock {
         pub fn acquire(_: &Path) -> Result<Self, String> {

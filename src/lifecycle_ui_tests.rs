@@ -4,12 +4,12 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-const CLOCK_WARNING: &str = "時間不連續，已改用本機時間；請手動校時。";
+const CLOCK_DEVIATION_NOTICE: &str = "E13：時間偏差過大，請重新校時";
 const NORMAL_SIZE: Vec2 = Vec2::new(400.0, 892.0);
 
 fn ready_ui() -> GroupUi {
     let mut ui = GroupUi::new();
-    let vault = bnauth_core::VaultSnapshot::new_empty(IMPORT_TEST_TIME);
+    let vault = bnauth_core::VaultSnapshot::new_empty();
     ui.use_memory_vault(vault);
     ui.app.dialog = None;
     for _ in 0..3 {
@@ -28,7 +28,7 @@ fn ready_ui_with_named_authenticator(name: &str) -> GroupUi {
 
 fn ready_ui_with_authenticator_details(name: &str, description: &str) -> GroupUi {
     let mut ui = ready_ui();
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let material =
         bnauth_core::parse_manual("1111111111111111111111111111111111111111", "", "").unwrap();
     let vault = bnauth_core::prepare_import(
@@ -37,10 +37,10 @@ fn ready_ui_with_authenticator_details(name: &str, description: &str) -> GroupUi
         description,
         original.ungrouped_id().unwrap(),
         material,
-        IMPORT_TEST_TIME,
     )
     .unwrap()
-    .candidate;
+    .candidate(&original)
+    .unwrap();
     ui.use_memory_vault(vault);
     for _ in 0..3 {
         visible_frame(&mut ui, NORMAL_SIZE, false);
@@ -84,15 +84,11 @@ fn visible_frame(ui: &mut GroupUi, size: Vec2, closing: bool) -> Vec<egui::Viewp
     visible_frame_at(ui, size, Pos2::new(100.0, 60.0), closing)
 }
 
-fn interactive_frame(ui: &mut GroupUi, events: Vec<egui::Event>) {
-    interactive_frame_at(ui, Pos2::new(100.0, 60.0), events);
-}
-
-fn interactive_frame_at(ui: &mut GroupUi, origin: Pos2, events: Vec<egui::Event>) {
+pub(super) fn interactive_frame(ui: &mut GroupUi, events: Vec<egui::Event>) {
     let mut input = viewport_input(ui, NORMAL_SIZE, false, false, false);
     input.events = events;
     let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
-    viewport.outer_rect = Some(Rect::from_min_size(origin, NORMAL_SIZE));
+    viewport.outer_rect = Some(Rect::from_min_size(Pos2::new(100.0, 60.0), NORMAL_SIZE));
     viewport.inner_rect = viewport.outer_rect;
     let ctx = ui.ctx.clone();
     let mut frame = eframe::Frame::_new_kittest();
@@ -104,7 +100,7 @@ fn interactive_frame_at(ui: &mut GroupUi, origin: Pos2, events: Vec<egui::Event>
     ui.shapes = output.shapes;
 }
 
-fn click_visible(ui: &mut GroupUi, point: Pos2) {
+pub(super) fn click_visible(ui: &mut GroupUi, point: Pos2) {
     for pressed in [true, false] {
         interactive_frame(
             ui,
@@ -164,11 +160,11 @@ fn long_unicode_notes_remain_complete_through_preview_details_and_unchanged_edit
         let mut ui = ready_ui_with_authenticator_details("長備註帳號", &note);
         let gate = gated_repository(&mut ui);
         gate.release();
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let id = ui.app.model.entries[0].id;
         let token = ui.app.model.change_token();
         assert_eq!(original.authenticators[0].description, note);
-        assert_eq!(ui.app.model.entries[0].description, note);
+        assert_eq!(ui.app.model.entries[0].record.description, note);
         assert_eq!(ui.app.model.entries[0].record.description, note);
         for _ in 0..8 {
             interactive_frame(&mut ui, Vec::new());
@@ -184,7 +180,7 @@ fn long_unicode_notes_remain_complete_through_preview_details_and_unchanged_edit
             assert_eq!(preview_len, note.len());
         }
 
-        ui.app.dialog = Some(Dialog::Details(id));
+        ui.app.dialog = Some(Dialog::details(&ui.app.model, &ui.app.model.entries[0]));
         for _ in 0..4 {
             interactive_frame(&mut ui, Vec::new());
         }
@@ -227,8 +223,8 @@ fn long_unicode_notes_remain_complete_through_preview_details_and_unchanged_edit
             assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
             assert_eq!(ui.app.model.change_token(), token);
             assert_eq!(ui.app.model.snapshot(), original);
-            assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-            assert_eq!(ui.app.model.entries[0].description, note);
+            assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+            assert_eq!(ui.app.model.entries[0].record.description, note);
             assert_eq!(ui.app.model.entries[0].record.description, note);
             assert!(!ui.app.runtime.app.saving && !ui.app.runtime.app.has_pending());
         }
@@ -238,7 +234,7 @@ fn long_unicode_notes_remain_complete_through_preview_details_and_unchanged_edit
 }
 
 #[test]
-fn unchanged_edit_is_silent_and_zero_writes_but_a_real_edit_still_saves_once() {
+fn unchanged_edit_skips_writing_and_failed_renames_keep_the_row_until_retry_or_discard() {
     for name in [
         "既有人工驗證器",
         "  帳號",
@@ -251,7 +247,7 @@ fn unchanged_edit_is_silent_and_zero_writes_but_a_real_edit_still_saves_once() {
         let mut ui = ready_ui_with_named_authenticator(name);
         let gate = gated_repository(&mut ui);
         gate.release();
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         assert_eq!(original.authenticators[0].name, name);
         let id = ui.app.model.entries[0].id;
         let token = ui.app.model.change_token();
@@ -266,13 +262,23 @@ fn unchanged_edit_is_silent_and_zero_writes_but_a_real_edit_still_saves_once() {
             assert!(ui.app.notifications.visible(Instant::now()).is_none());
             assert_eq!(gate.commits.load(Ordering::Relaxed), 0, "{name:?}");
             assert_eq!(ui.app.model.change_token(), token, "{name:?}");
-            assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-            // Includes the exact name, timestamps, revision and every other field.
+            assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
+            // Includes the exact name, revision and every other field.
             assert_eq!(ui.app.model.snapshot(), original);
             assert!(!ui.app.runtime.app.saving);
             assert!(!ui.app.runtime.app.has_pending());
         }
+    }
 
+    for retry in [false, true] {
+        let mut ui = ready_ui_with_authenticator();
+        let id = ui.app.model.entries[0].id;
+        let token = ui.app.model.change_token();
+        let failing = Arc::new(AtomicBool::new(true));
+        let gate = gated_repository_with_failure_flag(&mut ui, failing.clone());
+        let original = ui.app.runtime.app.current.as_ref().unwrap().clone();
+        ui.app.query = original.authenticators[0].name.clone();
+        ui.app.selected.insert(id);
         ui.app.edit(&ui.ctx, Some(id));
         for _ in 0..4 {
             interactive_frame(&mut ui, Vec::new());
@@ -293,17 +299,53 @@ fn unchanged_edit_is_silent_and_zero_writes_but_a_real_edit_still_saves_once() {
                         ..Default::default()
                     },
                 },
-                egui::Event::Text("實際修改的名稱".into()),
+                egui::Event::Text(" 實際修改的名稱  ".into()),
             ],
         );
         let apply = ui.point("套用");
         click_visible(&mut ui, apply);
+        assert!(ui.app.runtime.app.saving);
+        assert_eq!(ui.app.model.entries[0].record, original.authenticators[0]);
+        assert_eq!(ui.app.model.change_token(), token);
+        gate.release();
         wait_hidden(&mut ui, false);
+        assert!(ui.app.runtime.app.has_pending());
+        assert_eq!(ui.app.model.entries[0].record, original.authenticators[0]);
+        assert_eq!(ui.app.model.change_token(), token);
+        assert!(ui.app.selected.contains(&id));
         assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
-        let saved = ui.app.runtime.app.current.as_ref().unwrap();
-        assert_eq!(saved.revision, original.revision + 1);
-        assert_eq!(saved.authenticators[0].name, "實際修改的名稱");
-        assert_eq!(ui.app.notifications.visible(Instant::now()), Some("已保存"));
+        for _ in 0..3 {
+            interactive_frame(&mut ui, Vec::new());
+        }
+        failing.store(false, Ordering::Relaxed);
+        let retry_button = ui.point("重試");
+        let discard_button = ui.point("放棄");
+        assert!(retry_button.x < discard_button.x);
+        assert!((retry_button.y - discard_button.y).abs() < 1.0);
+        assert!(discard_button.x > NORMAL_SIZE.x / 2.0);
+        let action = if retry { retry_button } else { discard_button };
+        click_visible(&mut ui, action);
+        wait_hidden(&mut ui, false);
+        assert!(!ui.app.runtime.app.has_pending());
+        if retry {
+            assert_eq!(gate.commits.load(Ordering::Relaxed), 2);
+            let saved = ui.app.runtime.app.current.as_deref().unwrap();
+            assert_eq!(saved.revision, original.revision + 1);
+            assert_eq!(saved.authenticators[0].name, " 實際修改的名稱  ");
+            assert_eq!(ui.app.model.entries[0].record, saved.authenticators[0]);
+            assert!(ui.app.visible_ids().is_empty());
+            assert!(!ui.app.selected.contains(&id));
+        } else {
+            assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+            assert_eq!(ui.app.model.change_token(), token);
+            assert!(Arc::ptr_eq(
+                ui.app.runtime.app.current.as_ref().unwrap(),
+                &original
+            ));
+            assert_eq!(ui.app.model.entries[0].record, original.authenticators[0]);
+            assert_eq!(ui.app.visible_ids(), vec![id]);
+            assert!(ui.app.selected.contains(&id));
+        }
     }
 }
 
@@ -318,9 +360,9 @@ fn notes_only_edit_preserves_the_exact_imported_name_and_saves_once() {
     ] {
         let mut ui = ready_ui_with_authenticator_details(name, "原始備註");
         let gate = gated_repository(&mut ui);
-        gate.release();
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let id = ui.app.model.entries[0].id;
+        let projection = ui.app.model.projection_token();
         ui.app.edit(&ui.ctx, Some(id));
         for _ in 0..4 {
             interactive_frame(&mut ui, Vec::new());
@@ -346,15 +388,18 @@ fn notes_only_edit_preserves_the_exact_imported_name_and_saves_once() {
         );
         let apply = ui.point("套用");
         click_visible(&mut ui, apply);
+        assert_eq!(ui.app.model.entries[0].record.description, "原始備註");
+        gate.release();
         wait_hidden(&mut ui, false);
         assert!(ui.app.dialog.is_none());
         assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
-        let saved = ui.app.runtime.app.current.clone().unwrap();
+        let saved = ui.app.runtime.app.current.as_deref().unwrap().clone();
         assert_eq!(saved.revision, original.revision + 1);
         let mut expected = original.authenticators[0].clone();
         expected.description = "只修改備註".into();
-        expected.updated_at_ms = saved.authenticators[0].updated_at_ms;
         assert_eq!(saved.authenticators[0], expected, "{name:?}");
+        assert_eq!(ui.app.model.entries[0].record, expected);
+        assert_eq!(ui.app.model.projection_token(), projection);
         let json = bnauth_adapters::native::encode(&saved).unwrap();
         assert_eq!(bnauth_adapters::native::decode(&json).unwrap(), saved);
 
@@ -367,15 +412,22 @@ fn notes_only_edit_preserves_the_exact_imported_name_and_saves_once() {
         click_visible(&mut ui, apply);
         assert!(ui.app.dialog.is_none());
         assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
-        assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&saved));
+        assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&saved));
         assert!(!ui.app.runtime.app.has_pending());
     }
 }
 
 #[test]
-fn moving_to_the_current_group_is_silent_and_zero_writes_but_a_real_move_saves_once() {
+fn batch_move_offers_only_groups_that_will_receive_records_and_saves_once() {
     let mut ui = ready_ui_with_authenticator();
-    let mut vault = ui.app.runtime.app.current.clone().unwrap();
+    let mut vault = ui.app.runtime.app.current.as_deref().unwrap().clone();
+    let source = vault.authenticators[0].group_id;
+    ui.app.selected.insert(ui.app.model.entries[0].id);
+    interactive_frame(&mut ui, Vec::new());
+    let button = ui.point("移動");
+    click_visible(&mut ui, button);
+    assert!(!egui::Popup::is_any_open(&ui.ctx));
+
     let target = uuid::Uuid::new_v4();
     vault.groups.push(bnauth_core::Group {
         id: target,
@@ -383,33 +435,153 @@ fn moving_to_the_current_group_is_silent_and_zero_writes_but_a_real_move_saves_o
         sort_order: 1,
         is_ungrouped: false,
     });
-    ui.use_memory_vault(vault.clone());
-    let gate = gated_repository(&mut ui);
+    for mixed in [false, true] {
+        let mut vault = vault.clone();
+        let mut second = vault.authenticators[0].clone();
+        second.id = uuid::Uuid::new_v4();
+        second.group_id = if mixed { target } else { source };
+        second.sort_order = if mixed { 0 } else { 1 };
+        vault.authenticators.push(second);
+        ui.use_memory_vault(vault.clone());
+        let fail_first_move = !mixed;
+        let failure = Arc::new(AtomicBool::new(fail_first_move));
+        let gate = gated_repository_with_failure_flag(&mut ui, failure.clone());
+        gate.release();
+        ui.app.query = "人工驗證器".into();
+        let selected: BTreeSet<_> = ui.app.model.entries.iter().map(|entry| entry.id).collect();
+        *ui.app.selected = selected.clone();
+        let original_order = ui.app.model.filtered(ui.app.model.groups[0].id, "", false);
+        for _ in 0..4 {
+            interactive_frame(&mut ui, Vec::new());
+        }
+        let button = ui.point("移動");
+        click_visible(&mut ui, button);
+        let target_item = if mixed {
+            assert!(!ui.points("移動目標    1/100").is_empty());
+            ui.point("預設    1/100")
+        } else {
+            assert!(ui.points("預設    2/100").is_empty());
+            ui.point("移動目標    0/100")
+        };
+        assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
+        click_visible(&mut ui, target_item);
+        wait_hidden(&mut ui, false);
+        if fail_first_move {
+            assert!(ui.app.runtime.app.has_pending());
+            assert_eq!(*ui.app.selected, selected);
+            for _ in 0..3 {
+                interactive_frame(&mut ui, Vec::new());
+            }
+            let discard = ui.point("放棄");
+            click_visible(&mut ui, discard);
+            for _ in 0..3 {
+                interactive_frame(&mut ui, Vec::new());
+            }
+            assert!(!ui.app.runtime.app.has_pending());
+            assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&vault));
+            assert_eq!(*ui.app.selected, selected);
+            let model = &ui.app.model;
+            assert_eq!(
+                model.filtered(model.groups[0].id, "", false),
+                original_order
+            );
+            assert_eq!(model.group_count(model.groups[0].id), 2);
+            assert_eq!(model.group_count(model.groups[1].id), 0);
+            assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+
+            failure.store(false, Ordering::Relaxed);
+            let button = ui.point("移動");
+            click_visible(&mut ui, button);
+            let target_item = ui.point("移動目標    0/100");
+            click_visible(&mut ui, target_item);
+            wait_hidden(&mut ui, false);
+        }
+        assert_eq!(
+            gate.commits.load(Ordering::Relaxed),
+            1 + usize::from(fail_first_move)
+        );
+        assert!(ui.app.selected.is_empty());
+        let saved = ui.app.runtime.app.current.as_deref().unwrap();
+        assert_eq!(saved.revision, vault.revision + 1);
+        let destination = if mixed { source } else { target };
+        assert!(
+            saved
+                .authenticators
+                .iter()
+                .all(|row| row.group_id == destination)
+        );
+    }
+}
+
+#[test]
+fn row_copy_menu_saves_the_complete_record_once_and_keeps_the_source() {
+    let mut ui = ready_ui_with_authenticator_details("要複製的驗證器", "備註\n第二行");
+    let mut vault = ui.app.runtime.app.current.as_deref().unwrap().clone();
+    let target = uuid::Uuid::new_v4();
+    vault.groups.push(bnauth_core::Group {
+        id: target,
+        name: "複製目標".into(),
+        sort_order: 1,
+        is_ungrouped: false,
+    });
+    let record = &mut vault.authenticators[0];
+    record.serial = Some("US123456789012".into());
+    record.restore_code = Some("AB12CD34EF".into());
+    let before = record.clone();
+    let mut existing = before.clone();
+    existing.id = uuid::Uuid::new_v4();
+    existing.group_id = target;
+    existing.name = "同密鑰既有紀錄".into();
+    vault.authenticators.push(existing.clone());
+    ui.use_memory_vault(vault);
+    ui.app.query = "要複製".into();
+    let source_id = ui.app.model.entries[0].id;
+    let fail = Arc::new(AtomicBool::new(true));
+    let gate = gated_repository_with_failure_flag(&mut ui, fail.clone());
     gate.release();
-    let id = ui.app.model.entries[0].id;
-    ui.app.selected.insert(id);
     for _ in 0..4 {
         interactive_frame(&mut ui, Vec::new());
     }
-    let button = ui.point("移動");
-    click_visible(&mut ui, button);
-    let current = ui.point("未分組    1/100");
-    click_visible(&mut ui, current);
-    assert!(ui.app.notifications.visible(Instant::now()).is_none());
-    assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&vault));
-    assert!(!ui.app.runtime.app.has_pending());
-
-    let button = ui.point("移動");
-    click_visible(&mut ui, button);
-    let target_item = ui.point("移動目標    0/100");
+    let more = Pos2::new(NORMAL_SIZE.x - 36.0, ui.point("要複製的驗證器").y + 29.0);
+    click_visible(&mut ui, more);
+    for action in ["移動至分組", "複製到分組"] {
+        let submenu = ui.point(action);
+        for _ in 0..10 {
+            interactive_frame(&mut ui, vec![egui::Event::PointerMoved(submenu)]);
+        }
+        assert!(ui.points("預設    1/100").is_empty());
+        assert!(!ui.points("複製目標    1/100").is_empty());
+    }
+    let target_item = ui.point("複製目標    1/100");
     click_visible(&mut ui, target_item);
-    wait_hidden(&mut ui, false);
-    assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
-    let saved = ui.app.runtime.app.current.as_ref().unwrap();
-    assert_eq!(saved.revision, vault.revision + 1);
-    assert_eq!(saved.authenticators[0].group_id, target);
-    assert_eq!(ui.app.notifications.visible(Instant::now()), Some("已保存"));
+    wait_runtime(&mut ui);
+    assert!(ui.app.runtime.app.has_pending());
+    assert_eq!(ui.app.model.entries.len(), 2);
+    assert_eq!(ui.app.model.group_count(1), 1);
+    assert_eq!(ui.app.visible_ids(), vec![source_id]);
+    fail.store(false, Ordering::Relaxed);
+    ui.app.runtime.retry_pending_save().unwrap();
+    wait_runtime(&mut ui);
+    assert_eq!(gate.commits.load(Ordering::Relaxed), 2);
+    assert_eq!(ui.app.model.group_count(1), 2);
+    let copied_id = ui.app.model.entries.last().unwrap().id;
+    assert_eq!(ui.app.visible_ids(), vec![source_id, copied_id]);
+
+    let saved = ui.app.runtime.app.current.as_deref().unwrap();
+    assert_eq!(saved.revision, 1);
+    assert_eq!(saved.authenticators.len(), 3);
+    assert_eq!(saved.authenticators[0], before);
+    assert_eq!(saved.authenticators[1], existing);
+    let copy = &saved.authenticators[2];
+    assert_ne!(copy.id, before.id);
+    assert_ne!(copy.id, existing.id);
+    let mut expected = before;
+    expected.id = copy.id;
+    expected.group_id = target;
+    expected.sort_order = 1;
+    assert_eq!(copy, &expected);
+    assert_eq!(ui.app.group, crate::model::UNGROUPED_ID);
+    assert!(ui.app.runtime.sync_rx.is_none());
 }
 
 #[test]
@@ -423,7 +595,8 @@ fn unchanged_loaded_group_rename_never_saves_on_close_or_focus_loss() {
     ] {
         for close in [true, false] {
             let mut ui = ready_ui();
-            let mut vault = ui.app.runtime.app.current.clone().unwrap();
+            ui.size = NORMAL_SIZE;
+            let mut vault = ui.app.runtime.app.current.as_deref().unwrap().clone();
             vault.groups.push(bnauth_core::Group {
                 id: uuid::Uuid::new_v4(),
                 name: name.into(),
@@ -438,11 +611,7 @@ fn unchanged_loaded_group_rename_never_saves_on_close_or_focus_loss() {
             gate.release();
             let id = ui.app.model.groups[1].id;
             let token = ui.app.model.change_token();
-            ui.open(Dialog::Groups {
-                name: String::new(),
-                rename: None,
-                error: String::new(),
-            });
+            ui.open(Dialog::groups(&ui.app.model));
             ui.edit_group(id);
             for _ in 0..3 {
                 interactive_frame(&mut ui, Vec::new());
@@ -453,6 +622,17 @@ fn unchanged_loaded_group_rename_never_saves_on_close_or_focus_loss() {
                 ui.group_point(0)
             };
             click_visible(&mut ui, point);
+            if !close {
+                let input = ui.point("輸入名稱後按 Enter 新增");
+                click_visible(&mut ui, input);
+                interactive_frame(&mut ui, vec![egui::Event::Text("暫時新增".into())]);
+                ui.key(egui::Key::Enter);
+                let added = ui.group_draft().groups.last().unwrap().id;
+                let delete = ui.action_point(added, "刪除");
+                click_visible(&mut ui, delete);
+                let apply = ui.point("套用");
+                click_visible(&mut ui, apply);
+            }
             assert_eq!(
                 gate.commits.load(Ordering::Relaxed),
                 0,
@@ -460,23 +640,20 @@ fn unchanged_loaded_group_rename_never_saves_on_close_or_focus_loss() {
             );
             assert_eq!(ui.app.model.change_token(), token);
             assert_eq!(ui.app.model.snapshot(), original);
-            assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
+            assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
             assert!(!ui.app.runtime.app.has_pending());
             assert!(!ui.app.runtime.app.saving);
 
-            // A real edit through the same form must still submit exactly once.
-            ui.open(Dialog::Groups {
-                name: String::new(),
-                rename: None,
-                error: String::new(),
-            });
+            // Keep the rename in the draft until Apply, including when it still has focus.
+            ui.open(Dialog::groups(&ui.app.model));
             ui.edit_group(id);
             interactive_frame(&mut ui, vec![egui::Event::Text("實際修改的分組".into())]);
-            let point = ui.point("×");
+            assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
+            let point = ui.point("套用");
             click_visible(&mut ui, point);
             wait_hidden(&mut ui, false);
             assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
-            let saved = ui.app.runtime.app.current.as_ref().unwrap();
+            let saved = ui.app.runtime.app.current.as_deref().unwrap();
             assert_eq!(saved.groups[1].name, "實際修改的分組");
             assert_eq!(saved.revision, original.revision + 1);
         }
@@ -488,14 +665,18 @@ fn delete_confirmation_is_read_only_until_confirm_and_saves_the_selected_batch_o
     let mut ui = ready_ui();
     let vault = large_list_vault();
     ui.use_memory_vault(vault.clone());
-    let gate = gated_repository(&mut ui);
+    ui.app.query = "row 0".into();
+    let matches = ui.app.visible_ids();
+    let fail = Arc::new(AtomicBool::new(true));
+    let gate = gated_repository_with_failure_flag(&mut ui, fail.clone());
     gate.release();
     let ids: BTreeSet<_> = ui.app.model.entries[..100].iter().map(|e| e.id).collect();
     let token = ui.app.model.change_token();
     interactive_frame(&mut ui, Vec::new());
     assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
-    for confirm in [false, true] {
-        ui.app.selected = ids.clone();
+    for attempt in 0..3 {
+        let commits = gate.commits.load(Ordering::Relaxed);
+        *ui.app.selected = ids.clone();
         for _ in 0..3 {
             interactive_frame(&mut ui, Vec::new());
         }
@@ -505,25 +686,57 @@ fn delete_confirmation_is_read_only_until_confirm_and_saves_the_selected_batch_o
             interactive_frame(&mut ui, Vec::new());
         }
         assert!(matches!(ui.app.dialog, Some(Dialog::Delete(_))));
-        assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
+        assert_eq!(gate.commits.load(Ordering::Relaxed), commits);
         assert_eq!(ui.app.model.change_token(), token);
         assert_eq!(ui.app.model.snapshot(), vault);
         assert!(!ui.app.runtime.app.has_pending());
-        let action = ui.point(if confirm { "確認刪除" } else { "×" });
+        let dialog = ui.dialog_content_rect();
+        let action = ui
+            .points(if attempt == 0 { "×" } else { "確認" })
+            .into_iter()
+            .find(|point| dialog.contains(*point))
+            .expect("Expected the delete dialog action");
         click_visible(&mut ui, action);
         assert!(ui.app.dialog.is_none());
-        if !confirm {
+        if attempt == 0 {
             assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
-            assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&vault));
+            assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&vault));
+        } else if attempt == 1 {
+            wait_hidden(&mut ui, false);
+            assert!(ui.app.runtime.app.has_pending());
+            ui.app.discard_unsaved_changes();
+            assert_eq!(ui.app.model.change_token(), token);
+            assert_eq!(*ui.app.selected, ids);
+            assert_eq!(ui.app.visible_ids(), matches);
+            assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+            fail.store(false, Ordering::Relaxed);
         }
     }
     wait_hidden(&mut ui, false);
-    assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
-    let saved = ui.app.runtime.app.current.as_ref().unwrap();
+    assert_eq!(gate.commits.load(Ordering::Relaxed), 2);
+    assert!(ui.app.selected.is_empty());
+    assert_eq!(ui.app.visible_ids(), matches[100..]);
+    let saved = ui.app.runtime.app.current.as_deref().unwrap();
     assert_eq!(saved.revision, vault.revision + 1);
-    assert_eq!(saved.authenticators, vault.authenticators[100..]);
+    assert_eq!(saved.authenticators[..], vault.authenticators[100..]);
     assert_eq!(saved.groups, vault.groups);
     saved.validate().unwrap();
+
+    ui.app.query = "row 01".into();
+    interactive_frame(&mut ui, Vec::new());
+    let select_all = ui.point("全選");
+    click_visible(&mut ui, select_all);
+    assert_eq!(ui.app.selected.len(), 100);
+    let delete = ui.point("刪除");
+    click_visible(&mut ui, delete);
+    let confirm = ui.point("確認");
+    click_visible(&mut ui, confirm);
+    wait_hidden(&mut ui, false);
+    assert!(ui.app.visible_ids().is_empty());
+    assert!(ui.app.selected.is_empty());
+    let saved = ui.app.runtime.app.current.as_deref().unwrap();
+    assert_eq!(saved.authenticators[..], vault.authenticators[200..]);
+    assert_eq!(gate.commits.load(Ordering::Relaxed), 3);
 }
 
 fn visible_frame_at(
@@ -634,7 +847,7 @@ impl Drop for SaveGate {
 struct GatedRepository {
     released: Arc<AtomicBool>,
     commits: Arc<AtomicUsize>,
-    fail_commit: bool,
+    fail_commit: Arc<AtomicBool>,
 }
 
 impl GatedRepository {
@@ -657,7 +870,7 @@ impl bnauth_app::Repository for GatedRepository {
     ) -> Result<bnauth_app::CommitOutcome, String> {
         self.commits.fetch_add(1, Ordering::Relaxed);
         self.wait_for_release()?;
-        if self.fail_commit {
+        if self.fail_commit.load(Ordering::Relaxed) {
             return Err("人工延後保存失敗".into());
         }
         candidate.validate()?;
@@ -679,7 +892,11 @@ fn gated_repository(ui: &mut GroupUi) -> SaveGate {
 }
 
 fn gated_repository_mode(ui: &mut GroupUi, fail_commit: bool) -> SaveGate {
-    let vault = ui.app.runtime.app.current.clone().unwrap();
+    gated_repository_with_failure_flag(ui, Arc::new(AtomicBool::new(fail_commit)))
+}
+
+fn gated_repository_with_failure_flag(ui: &mut GroupUi, fail_commit: Arc<AtomicBool>) -> SaveGate {
+    let vault = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let released = Arc::new(AtomicBool::new(false));
     let commits = Arc::new(AtomicUsize::new(0));
     let repo_release = released.clone();
@@ -689,7 +906,7 @@ fn gated_repository_mode(ui: &mut GroupUi, fail_commit: bool) -> SaveGate {
             Box::new(GatedRepository {
                 released: repo_release.clone(),
                 commits: repo_commits.clone(),
-                fail_commit,
+                fail_commit: fail_commit.clone(),
             }),
             Some(vault.clone()),
         ))
@@ -712,7 +929,7 @@ fn queue_sync_result(ui: &mut GroupUi, result: Result<bnauth_core::clock::SyncSa
 }
 
 fn candidate_with_new_group(ui: &GroupUi) -> bnauth_core::VaultSnapshot {
-    let mut candidate = ui.app.runtime.app.current.clone().unwrap();
+    let mut candidate = ui.app.runtime.app.current.as_deref().unwrap().clone();
     candidate.groups.push(bnauth_core::Group {
         id: uuid::Uuid::new_v4(),
         name: "待保存分組".into(),
@@ -725,13 +942,13 @@ fn candidate_with_new_group(ui: &GroupUi) -> bnauth_core::VaultSnapshot {
 #[test]
 fn crossflow_failed_save_without_residue_keeps_its_error_and_offers_no_cleanup() {
     let mut ui = ready_ui();
-    let original = ui.app.runtime.app.current.clone().unwrap();
-    let gate = gated_repository_mode(&mut ui, true);
-    ui.app
-        .runtime
-        .app
-        .commit(candidate_with_new_group(&ui), false)
-        .unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
+    let failure = Arc::new(AtomicBool::new(true));
+    let gate = gated_repository_with_failure_flag(&mut ui, failure.clone());
+    ui.open(Dialog::groups(&ui.app.model));
+    ui.click(ui.point("輸入名稱後按 Enter 新增"));
+    ui.type_text("等待重試");
+    ui.click(ui.point("套用"));
     gate.release();
     wait_hidden(&mut ui, true);
     ui.view = TestView::Saving;
@@ -740,27 +957,40 @@ fn crossflow_failed_save_without_residue_keeps_its_error_and_offers_no_cleanup()
     }
     assert!(ui.app.runtime.app.has_pending());
     assert!(!ui.app.runtime.app.repository_state.needs_attention());
-    assert!(ui.points("只移除暫存檔").is_empty());
+    assert!(ui.points("清理暫存檔").is_empty());
     assert!(!ui.points("人工延後保存失敗").is_empty());
     for _ in 0..3 {
         visible_frame(&mut ui, NORMAL_SIZE, false);
         let app = &ui.app.runtime.app;
         assert_eq!(app.error.as_deref(), Some("人工延後保存失敗"));
         assert!(app.has_pending() && !app.saving && !app.cleaning);
-        assert_eq!(app.current.as_ref(), Some(&original));
+        assert_eq!(app.current.as_deref(), Some(&original));
         assert!(
-            ui.points("暫存檔已移除，但這次變更尚未保存。請按「重試保存」。")
+            ui.points("暫存檔已移除，但這次變更尚未保存。請按「重試」。")
                 .is_empty()
         );
     }
     assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+    assert_eq!(ui.app.model.groups.len(), 1);
+    assert!(ui.app.runtime.pending_groups.is_some());
+    failure.store(false, Ordering::Relaxed);
+    let retry = ui.point("重試");
+    click_visible(&mut ui, retry);
+    wait_hidden(&mut ui, true);
+    assert_eq!(gate.commits.load(Ordering::Relaxed), 2);
+    assert!(ui.app.runtime.pending_groups.is_none());
+    assert!(!ui.app.runtime.app.has_pending());
+    let saved = ui.app.runtime.app.current.as_deref().unwrap();
+    assert_eq!(saved.revision, original.revision + 1);
+    assert_eq!(saved.groups.last().unwrap().name, "等待重試");
+    assert_eq!(ui.app.model.snapshot(), *saved);
 }
 
 #[test]
 fn crossflow_import_saves_once_and_failed_candidate_owns_its_retry() {
     for fail_commit in [false, true] {
         let mut ui = ready_ui_with_authenticator();
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let gate = gated_repository_mode(&mut ui, fail_commit);
         // Model a request already in flight so import never uses the network.
         let (_sender, receiver) = std::sync::mpsc::channel();
@@ -768,19 +998,17 @@ fn crossflow_import_saves_once_and_failed_candidate_owns_its_retry() {
         ui.app.runtime.sync_manual = true;
         ui.open(Dialog::Import(Box::new(import_draft())));
         ui.click(ui.point("預覽匯入"));
-        let mut expected = ui.import().preview.as_ref().unwrap().candidate.clone();
-        expected.revision += 1;
         let moved_to = Pos2::new(150.0, 90.0);
         // Moving the viewport cannot create an additional save.
         visible_frame_at(&mut ui, NORMAL_SIZE, moved_to, false);
         ui.frame(Vec::new());
-        ui.click(ui.point("確認匯入並保存"));
+        ui.click(ui.point("確認"));
         assert!(ui.app.dialog.is_none());
         assert!(ui.app.runtime.app.saving && ui.app.runtime.app.has_pending());
         gate.release();
         wait_hidden(&mut ui, true);
         if fail_commit {
-            assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
+            assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
             assert!(ui.app.runtime.app.has_pending());
             ui.app.runtime.app.retry().unwrap();
             wait_hidden(&mut ui, true);
@@ -789,11 +1017,22 @@ fn crossflow_import_saves_once_and_failed_candidate_owns_its_retry() {
             for _ in 0..3 {
                 ui.frame(Vec::new());
             }
-            ui.click(ui.point("放棄這次未保存變更"));
+            let token = ui.app.model.change_token();
+            let record = &original.authenticators[0];
+            let code = ui.app.otp_cache.code(record, IMPORT_TEST_TIME);
+            let calculations = ui.app.otp_cache.calculations;
+            ui.click(ui.point("放棄"));
             assert_eq!(ui.app.model.snapshot(), original);
+            assert_eq!(ui.app.model.change_token(), token);
+            assert_eq!(ui.app.otp_cache.code(record, IMPORT_TEST_TIME), code);
+            assert_eq!(ui.app.otp_cache.calculations, calculations);
         } else {
-            assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&expected));
-            assert_eq!(ui.app.model.snapshot(), expected);
+            let saved = ui.app.runtime.app.current.as_deref().unwrap();
+            assert_eq!(saved.revision, original.revision + 1);
+            let (added, existing) = saved.authenticators.split_last().unwrap();
+            assert_eq!(existing, original.authenticators.as_slice());
+            assert_eq!(added.name, import_draft().name);
+            assert_eq!(&ui.app.model.snapshot(), saved);
         }
         for _ in 0..3 {
             visible_frame_at(&mut ui, NORMAL_SIZE, moved_to, false);
@@ -806,85 +1045,11 @@ fn crossflow_import_saves_once_and_failed_candidate_owns_its_retry() {
     }
 }
 
-struct WarningWithoutResidueRepository {
-    commits: Arc<AtomicUsize>,
-    cleanups: Arc<AtomicUsize>,
-}
-
-impl bnauth_app::Repository for WarningWithoutResidueRepository {
-    fn commit(
-        &mut self,
-        candidate: &bnauth_core::VaultSnapshot,
-    ) -> Result<bnauth_app::CommitOutcome, String> {
-        candidate.validate()?;
-        self.commits.fetch_add(1, Ordering::Relaxed);
-        let mut snapshot = candidate.clone();
-        snapshot.revision += 1;
-        Ok(bnauth_app::CommitOutcome {
-            snapshot,
-            warning: Some("資料已保存，但保存過程曾發生異常。".into()),
-        })
-    }
-
-    fn retry_cleanup(&mut self) -> Result<(), String> {
-        self.cleanups.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-}
-
 #[test]
-fn crossflow_saved_warning_without_residue_is_acknowledged_without_cleanup() {
-    for closing in [false, true] {
-        let mut ui = ready_ui();
-        let original = ui.app.runtime.app.current.clone().unwrap();
-        let commits = Arc::new(AtomicUsize::new(0));
-        let cleanups = Arc::new(AtomicUsize::new(0));
-        let repo_commits = commits.clone();
-        let repo_cleanups = cleanups.clone();
-        ui.app.runtime.app = bnauth_app::Application::start(Box::new(move || {
-            Ok((
-                Box::new(WarningWithoutResidueRepository {
-                    commits: repo_commits.clone(),
-                    cleanups: repo_cleanups.clone(),
-                }),
-                Some(original.clone()),
-            ))
-        }));
-        drain_memory_app(&mut ui.app.runtime.app);
-        ui.app
-            .runtime
-            .app
-            .commit(candidate_with_new_group(&ui), false)
-            .unwrap();
-        wait_hidden(&mut ui, true);
-        let saved = ui.app.runtime.app.current.clone().unwrap();
-        assert!(ui.app.runtime.app.warning.is_some());
-        assert!(!ui.app.runtime.app.repository_state.needs_attention());
-        assert!(ui.app.runtime.close_blocked());
-        ui.app.runtime.close_requested = closing;
-        ui.view = TestView::Saving;
-        for _ in 0..3 {
-            ui.frame(Vec::new());
-        }
-        assert!(ui.points("重試移除暫存檔").is_empty());
-        ui.click(ui.point("繼續"));
-        assert!(ui.app.runtime.app.warning.is_none());
-        assert!(!ui.app.runtime.close_blocked());
-        let commands = visible_frame(&mut ui, NORMAL_SIZE, false);
-        assert_eq!(commands.contains(&egui::ViewportCommand::Close), closing);
-        assert!(!ui.app.runtime.app.cleaning && !ui.app.runtime.app.has_pending());
-        assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&saved));
-        assert_eq!(commits.load(Ordering::Relaxed), 1);
-        assert_eq!(cleanups.load(Ordering::Relaxed), 0);
-        assert!(ui.points("暫存檔已移除。").is_empty());
-    }
-}
-
-#[test]
-fn hidden_close_protects_failed_candidate_and_residue_until_discard_and_cleanup() {
+fn hidden_close_protects_failed_candidate_until_discard() {
     for minimized in [true, false] {
         let mut ui = ready_ui();
-        let vault = ui.app.runtime.app.current.clone().unwrap();
+        let vault = ui.app.runtime.app.current.as_deref().unwrap().clone();
         ui.app.runtime.app = bnauth_app::Application::start(Box::new(move || {
             Ok((
                 Box::new(CleanupFailureRepository {
@@ -907,28 +1072,23 @@ fn hidden_close_protects_failed_candidate_and_residue_until_discard_and_cleanup(
         assert!(!commands.contains(&egui::ViewportCommand::Close));
         assert!(commands.contains(&egui::ViewportCommand::Focus));
         assert!(ui.app.runtime.close_requested);
-        // Explicit permission to retain residue still cannot discard a candidate.
-        ui.app.runtime.allow_close_with_residue = true;
-        let commands = hidden_frame(&mut ui, minimized, true);
-        assert!(commands.contains(&egui::ViewportCommand::CancelClose));
-        assert!(!commands.contains(&egui::ViewportCommand::Close));
-        ui.app.runtime.allow_close_with_residue = false;
         let commands = visible_frame(&mut ui, NORMAL_SIZE, true);
         assert!(commands.contains(&egui::ViewportCommand::CancelClose));
         assert!(!commands.contains(&egui::ViewportCommand::Close));
 
         ui.app.runtime.app.discard();
-        let commands = hidden_frame(&mut ui, minimized, true);
-        assert!(commands.contains(&egui::ViewportCommand::CancelClose));
-        assert!(!commands.contains(&egui::ViewportCommand::Close));
-        assert_eq!(ui.app.runtime.app.current.as_ref().unwrap().groups.len(), 1);
-        ui.app.runtime.app.retry_cleanup().unwrap();
-        let commands = wait_hidden(&mut ui, minimized);
+        let commands = hidden_frame(&mut ui, minimized, false);
+        assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
         assert!(commands.contains(&egui::ViewportCommand::Close));
+        assert_eq!(
+            ui.app.runtime.app.current.as_deref().unwrap().groups.len(),
+            1
+        );
         let app = &ui.app.runtime.app;
         assert!(!app.has_pending());
         assert!(!app.repository_state.needs_attention());
-        assert_eq!(app.current.as_ref().unwrap().revision, 0);
+        assert!(app.error.is_none());
+        assert_eq!(app.current.as_deref().unwrap().revision, 0);
     }
 }
 
@@ -936,12 +1096,11 @@ fn hidden_close_protects_failed_candidate_and_residue_until_discard_and_cleanup(
 fn time_sync_waits_for_a_result_and_reports_failures_after_the_sender_exits() {
     for previously_synced in [false, true] {
         for error in [
-            "校時連線逾時；請手動重試。",
-            "讀取校時回覆失敗或逾時；請手動重試。",
-            "校時回覆格式錯誤，timeMs 必須是唯一的整數 UTC 毫秒。",
+            "E11：連線異常，請重試",
+            "E12：HTTP 錯誤，服務回傳 HTTP 503。",
         ] {
             let mut ui = ready_ui_with_authenticator();
-            let original = ui.app.runtime.app.current.clone().unwrap();
+            let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
             let gate = gated_repository(&mut ui);
             gate.release();
             if previously_synced {
@@ -973,12 +1132,8 @@ fn time_sync_waits_for_a_result_and_reports_failures_after_the_sender_exits() {
             assert_eq!(runtime.clock.last_success(), last_success.as_ref());
             assert_eq!(runtime.clock.last_error(), Some(error));
             let first_paint = Instant::now();
-            let message = format!("校時失敗：{error}");
             assert_eq!(ui.app.notifications.pending_warning_count(), 1);
-            assert_eq!(
-                ui.app.notifications.visible(first_paint),
-                Some(message.as_str())
-            );
+            assert_eq!(ui.app.notifications.visible(first_paint), Some(error));
             assert!(
                 ui.app
                     .notifications
@@ -992,7 +1147,7 @@ fn time_sync_waits_for_a_result_and_reports_failures_after_the_sender_exits() {
             let runtime = &ui.app.runtime;
             assert!(!runtime.app.saving && !runtime.app.cleaning && !runtime.app.has_pending());
             assert!(runtime.app.error.is_none());
-            assert_eq!(runtime.app.current.as_ref(), Some(&original));
+            assert_eq!(runtime.app.current.as_deref(), Some(&original));
             assert_eq!(ui.app.model.snapshot(), original);
             assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
         }
@@ -1001,15 +1156,19 @@ fn time_sync_waits_for_a_result_and_reports_failures_after_the_sender_exits() {
 
 #[test]
 fn time_sync_success_is_saved_and_failed_rounds_keep_the_last_saved_calibration() {
-    for manual in [false, true] {
+    for (manual, rounds) in [
+        (false, &[true][..]),
+        (false, &[false][..]),
+        (true, &[true, false, true][..]),
+    ] {
         for hidden in [None, Some(true), Some(false)] {
             let mut ui = ready_ui_with_authenticator();
-            let original = ui.app.runtime.app.current.clone().unwrap();
+            let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
             let gate = gated_repository(&mut ui);
             gate.release();
             let mut expected_record = None;
             let mut successful_rounds = 0;
-            for succeeds in [true, false, true] {
+            for &succeeds in rounds {
                 ui.app.notifications = Default::default();
                 let result = if succeeds {
                     successful_rounds += 1;
@@ -1044,9 +1203,10 @@ fn time_sync_success_is_saved_and_failed_rounds_keep_the_last_saved_calibration(
                 }
                 wait_hidden(&mut ui, true);
                 let runtime = &ui.app.runtime;
-                assert!(runtime.sync_rx.is_none() && runtime.clock.is_synced());
+                assert!(runtime.sync_rx.is_none());
+                assert_eq!(runtime.clock.is_synced(), expected_record.is_some());
                 assert!(!runtime.app.saving && !runtime.app.has_pending());
-                let current = runtime.app.current.as_ref().unwrap();
+                let current = runtime.app.current.as_deref().unwrap();
                 assert_eq!(current.service_time_sync.battlenet, expected_record);
                 assert_eq!(current.authenticators, original.authenticators);
                 assert_eq!(current.groups, original.groups);
@@ -1059,9 +1219,9 @@ fn time_sync_success_is_saved_and_failed_rounds_keep_the_last_saved_calibration(
                     assert_eq!(
                         ui.app.notifications.visible(Instant::now()),
                         Some(if succeeds {
-                            "校時成功並已保存"
+                            "校時成功"
                         } else {
-                            "校時失敗：人工校時失敗"
+                            "人工校時失敗"
                         })
                     );
                 } else {
@@ -1078,7 +1238,7 @@ fn a_successful_sync_received_during_close_is_saved_before_close_but_failure_doe
     for hidden in [None, Some(true), Some(false)] {
         for succeeds in [true, false] {
             let mut ui = ready_ui_with_authenticator();
-            let original = ui.app.runtime.app.current.clone().unwrap();
+            let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
             let gate = gated_repository(&mut ui);
             let sample = fresh_sync_sample();
             let expected = sample.record.clone();
@@ -1104,7 +1264,7 @@ fn a_successful_sync_received_during_close_is_saved_before_close_but_failure_doe
             let runtime = &ui.app.runtime;
             assert!(runtime.close_requested && !runtime.close_blocked());
             assert_eq!(runtime.clock.is_synced(), succeeds);
-            let current = runtime.app.current.as_ref().unwrap();
+            let current = runtime.app.current.as_deref().unwrap();
             assert_eq!(current.revision, original.revision + u64::from(succeeds));
             assert_eq!(
                 current.service_time_sync.battlenet.as_ref(),
@@ -1120,14 +1280,12 @@ fn a_successful_sync_received_during_close_is_saved_before_close_but_failure_doe
 fn time_sync_during_a_data_save_waits_for_its_ack_and_preserves_both_changes() {
     for fail_commit in [false, true] {
         let mut ui = ready_ui_with_authenticator();
-        let original = ui.app.runtime.app.current.clone().unwrap();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let gate = gated_repository_mode(&mut ui, fail_commit);
         let (sender, receiver) = std::sync::mpsc::channel();
         ui.app.runtime.sync_rx = Some(receiver);
         ui.app.runtime.sync_manual = true;
-        let before = ui.app.model.change_token();
-        ui.app.model.add_group("與校時同時保存的資料").unwrap();
-        ui.app.persist_frame_changes(before, &ui.ctx);
+        ui.submit_group("與校時同時保存的資料");
         assert!(ui.app.runtime.app.saving);
         let sample = fresh_sync_sample();
         let expected = sample.record.clone();
@@ -1144,7 +1302,7 @@ fn time_sync_during_a_data_save_waits_for_its_ack_and_preserves_both_changes() {
         wait_hidden(&mut ui, true);
         let runtime = &ui.app.runtime;
         assert_eq!(runtime.app.has_pending(), fail_commit);
-        let current = runtime.app.current.as_ref().unwrap();
+        let current = runtime.app.current.as_deref().unwrap();
         if fail_commit {
             assert_eq!(current, &original);
             assert_eq!(runtime.pending_clock_record.as_ref(), Some(&expected));
@@ -1169,9 +1327,9 @@ fn time_sync_during_a_data_save_waits_for_its_ack_and_preserves_both_changes() {
 }
 
 #[test]
-fn new_secret_import_reuses_an_active_sync_and_saves_its_result_after_the_import() {
+fn import_without_calibration_reuses_an_active_sync_and_saves_its_result() {
     let mut ui = ready_ui_with_authenticator();
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let gate = gated_repository(&mut ui);
     let material = bnauth_core::parse_manual(
         "3132333435363738393031323334353637383930",
@@ -1185,22 +1343,23 @@ fn new_secret_import_reuses_an_active_sync_and_saves_its_result_after_the_import
         "",
         original.ungrouped_id().unwrap(),
         material,
-        bnauth_core::now_ms(),
     )
     .unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     ui.app.runtime.sync_rx = Some(receiver);
     ui.app.runtime.sync_manual = true;
-    ui.app.runtime.app.commit(preview.candidate, true).unwrap();
+    let candidate = preview.candidate(&original).unwrap();
+    ui.app.runtime.app.commit(candidate, true).unwrap();
     gate.release();
     wait_hidden(&mut ui, true);
-    let imported = ui.app.runtime.app.current.clone().unwrap();
+    let imported = ui.app.runtime.app.current.as_deref().unwrap().clone();
     assert_eq!(
         imported.authenticators.len(),
         original.authenticators.len() + 1
     );
     assert_eq!(imported.revision, original.revision + 1);
     assert!(ui.app.runtime.sync_rx.is_some());
+    assert_eq!(ui.app.runtime.sync_requests, 0);
     let sample = fresh_sync_sample();
     let expected = sample.record.clone();
     sender.send(Ok(sample)).unwrap();
@@ -1209,7 +1368,7 @@ fn new_secret_import_reuses_an_active_sync_and_saves_its_result_after_the_import
     let runtime = &ui.app.runtime;
     assert!(runtime.clock.is_synced() && runtime.sync_rx.is_none());
     assert!(!runtime.app.saving && !runtime.app.has_pending());
-    let current = runtime.app.current.as_ref().unwrap();
+    let current = runtime.app.current.as_deref().unwrap();
     assert_eq!(current.authenticators, imported.authenticators);
     assert_eq!(current.groups, imported.groups);
     assert_eq!(
@@ -1248,7 +1407,7 @@ fn hidden_save_completion_finishes_close_after_data_and_calibration_are_saved() 
     loop {
         let commands = hidden_frame(&mut ui, true, false);
         let runtime = &ui.app.runtime;
-        let current = runtime.app.current.as_ref().unwrap();
+        let current = runtime.app.current.as_deref().unwrap();
         if commands.contains(&egui::ViewportCommand::Close) {
             assert_eq!(
                 current.revision, 2,
@@ -1274,7 +1433,7 @@ fn clock_warning_is_shown_on_busy_pages_and_not_replaced_by_hidden_commit_ack() 
         let gate = gated_repository(&mut ui);
         let candidate = candidate_with_new_group(&ui);
         ui.app.runtime.app.commit(candidate, false).unwrap();
-        ui.app.warn(CLOCK_WARNING);
+        ui.app.warn(CLOCK_DEVIATION_NOTICE);
         for _ in 0..3 {
             if paint_before_ack {
                 visible_frame(&mut ui, NORMAL_SIZE, false);
@@ -1283,101 +1442,107 @@ fn clock_warning_is_shown_on_busy_pages_and_not_replaced_by_hidden_commit_ack() 
             }
         }
         if paint_before_ack {
-            assert!(!ui.points(CLOCK_WARNING).is_empty());
+            assert!(!ui.points(CLOCK_DEVIATION_NOTICE).is_empty());
         }
         gate.release();
         wait_hidden(&mut ui, true);
-        assert_eq!(ui.app.runtime.app.current.as_ref().unwrap().revision, 1);
+        assert_eq!(ui.app.runtime.app.current.as_deref().unwrap().revision, 1);
         for _ in 0..3 {
             visible_frame(&mut ui, NORMAL_SIZE, false);
         }
         assert!(
-            !ui.points(CLOCK_WARNING).is_empty(),
+            !ui.points(CLOCK_DEVIATION_NOTICE).is_empty(),
             "the ordinary saved message must not replace the warning"
         );
     }
 }
 
 #[test]
-fn clock_warning_is_also_painted_on_startup_error_page() {
-    let mut ui = ready_ui();
-    ui.app.runtime.app =
-        bnauth_app::Application::start(Box::new(|| Err("人工資料讀取失敗".into())));
-    wait_hidden(&mut ui, true);
-    assert_eq!(ui.app.runtime.app.phase, bnauth_app::Phase::Error);
-    ui.app.warn(CLOCK_WARNING);
-    for _ in 0..3 {
-        visible_frame(&mut ui, NORMAL_SIZE, false);
+fn closing_after_discard_of_an_unverified_save_does_not_commit_a_late_sync_result() {
+    struct UnverifiedRepository {
+        commits: Arc<AtomicUsize>,
+        blocked: bool,
     }
-    assert!(!ui.points("無法開啟資料檔").is_empty());
-    assert!(!ui.points(CLOCK_WARNING).is_empty());
-}
 
-#[test]
-fn explicit_residue_exit_from_warning_page_does_not_add_a_commit_for_a_late_sync_result() {
+    impl bnauth_app::Repository for UnverifiedRepository {
+        fn state(&self) -> bnauth_app::RepositoryState {
+            bnauth_app::RepositoryState {
+                blocked: self.blocked,
+                ..Default::default()
+            }
+        }
+
+        fn commit(
+            &mut self,
+            _: &bnauth_core::VaultSnapshot,
+        ) -> Result<bnauth_app::CommitOutcome, String> {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.blocked = true;
+            Err(bnauth_core::ErrorCode::WriteFailed
+                .with_detail("無法讀回設定檔核對或恢復檔案保護。")
+                .to_string())
+        }
+
+        fn retry_cleanup(&mut self) -> Result<(), String> {
+            panic!("the unverified files must be preserved")
+        }
+    }
+
     let mut ui = ready_ui_with_authenticator();
-    let vault = ui.app.runtime.app.current.clone().unwrap();
-    let released = Arc::new(AtomicBool::new(false));
+    let vault = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let commits = Arc::new(AtomicUsize::new(0));
-    let repo_release = released.clone();
     let repo_commits = commits.clone();
-    let gate = SaveGate { released, commits };
+    let original = vault.clone();
     ui.app.runtime.app = bnauth_app::Application::start(Box::new(move || {
         Ok((
-            Box::new(CompletionNeedsAttentionRepository {
-                gate: GatedRepository {
-                    released: repo_release.clone(),
-                    commits: repo_commits.clone(),
-                    fail_commit: false,
-                },
-                committed_warning: true,
-                cleanup_required: false,
+            Box::new(UnverifiedRepository {
+                commits: repo_commits.clone(),
+                blocked: false,
             }),
             Some(vault.clone()),
         ))
     }));
     drain_memory_app(&mut ui.app.runtime.app);
-    // Start a request before a real edit; its reply stays pending throughout
-    // the save and the user's decision on the resulting cleanup-warning page.
     let (sender, receiver) = std::sync::mpsc::channel();
     ui.app.runtime.sync_rx = Some(receiver);
     ui.app.runtime.sync_manual = true;
-    let before = ui.app.model.change_token();
-    ui.app.model.add_group("已保存但暫存未移除").unwrap();
-    ui.app.persist_frame_changes(before, &ui.ctx);
-    gate.release();
+    ui.submit_group("待核對的分組");
     wait_hidden(&mut ui, true);
-    let saved = ui.app.runtime.app.current.clone().unwrap();
     let app = &ui.app.runtime.app;
-    assert!(!app.saving && !app.cleaning && !app.has_pending());
-    assert!(app.warning.is_some() && app.repository_state.cleanup_required);
-    assert!(!ui.app.runtime.allow_close_with_residue);
+    assert!(!app.saving && !app.cleaning && app.has_pending());
+    assert!(app.repository_state.blocked);
 
     let moved_to = Pos2::new(150.0, 90.0);
     visible_frame_at(&mut ui, NORMAL_SIZE, moved_to, false);
-    ui.view = TestView::Saving;
-    for _ in 0..3 {
-        ui.frame(Vec::new());
-    }
-    ui.click(ui.point("保留檔案並關閉"));
+    assert!(!ui.points("寫入失敗").is_empty());
+    assert!(ui.points("無法讀回設定檔核對或恢復檔案保護。").is_empty());
+    let discard = ui.point("放棄");
+    click_visible(&mut ui, discard);
+    assert!(ui.points("寫入失敗").is_empty());
+    assert!(ui.points("資料檔需要檢查").is_empty());
+    assert!(!ui.points("既有人工驗證器").is_empty());
+    let add = ui.point("＋ 新增");
+    click_visible(&mut ui, add);
+    assert!(ui.points("從密鑰恢復").is_empty());
     let runtime = &ui.app.runtime;
-    assert!(runtime.allow_close_with_residue && runtime.close_requested);
+    assert!(runtime.app.error.is_none());
+    assert!(!runtime.close_requested);
     assert!(!runtime.close_blocked());
 
     let sample = fresh_sync_sample();
     let history = sample.record.clone();
     sender.send(Ok(sample)).unwrap();
     drop(sender);
-    let commands = visible_frame_at(&mut ui, NORMAL_SIZE, moved_to, false);
-    assert!(commands.contains(&egui::ViewportCommand::Close));
+    let commands = visible_frame_at(&mut ui, NORMAL_SIZE, moved_to, true);
     assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
     let runtime = &ui.app.runtime;
+    assert!(runtime.close_requested && !runtime.close_blocked());
     assert!(runtime.clock.is_synced() && runtime.sync_rx.is_none());
     assert_eq!(runtime.clock.last_success(), Some(&history));
     assert!(!runtime.app.saving && !runtime.app.cleaning && !runtime.app.has_pending());
-    assert!(runtime.app.warning.is_some() && runtime.app.repository_state.cleanup_required);
-    assert_eq!(runtime.app.current.as_ref(), Some(&saved));
-    assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
+    assert!(runtime.app.repository_state.blocked);
+    assert_eq!(runtime.app.current.as_deref(), Some(&original));
+    assert_eq!(commits.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -1406,7 +1571,7 @@ fn hidden_close_during_save_reveals_a_later_failure_without_losing_the_candidate
             assert!(commands.contains(&egui::ViewportCommand::Minimized(false)));
             assert!(commands.contains(&egui::ViewportCommand::Visible(true)));
             assert!(commands.contains(&egui::ViewportCommand::Focus));
-            assert_eq!(app.current.as_ref().unwrap().groups.len(), 1);
+            assert_eq!(app.current.as_deref().unwrap().groups.len(), 1);
             break;
         }
         assert!(
@@ -1424,24 +1589,17 @@ fn hidden_close_during_save_reveals_a_later_failure_without_losing_the_candidate
 
 struct CompletionNeedsAttentionRepository {
     gate: GatedRepository,
-    committed_warning: bool,
     cleanup_required: bool,
 }
 
 impl bnauth_app::Repository for CompletionNeedsAttentionRepository {
     fn commit(
         &mut self,
-        candidate: &bnauth_core::VaultSnapshot,
+        _candidate: &bnauth_core::VaultSnapshot,
     ) -> Result<bnauth_app::CommitOutcome, String> {
         self.cleanup_required = true;
-        if self.committed_warning {
-            let mut outcome = self.gate.commit(candidate)?;
-            outcome.warning = Some("人工提交成功，但清理暫存失敗".into());
-            Ok(outcome)
-        } else {
-            self.gate.commits.fetch_add(1, Ordering::Relaxed);
-            Err("人工保存失敗，暫存檔需清理".into())
-        }
+        self.gate.commits.fetch_add(1, Ordering::Relaxed);
+        Err("人工保存失敗，暫存檔需清理".into())
     }
 
     fn retry_cleanup(&mut self) -> Result<(), String> {
@@ -1453,15 +1611,16 @@ impl bnauth_app::Repository for CompletionNeedsAttentionRepository {
     fn state(&self) -> bnauth_app::RepositoryState {
         bnauth_app::RepositoryState {
             cleanup_required: self.cleanup_required,
-            blocked: false,
+            ..Default::default()
         }
     }
 }
 
-fn assert_hidden_close_reveals_completed_work_once(committed_warning: bool) {
+#[test]
+fn hidden_close_reveals_successful_cleanup_with_pending_candidate_once() {
     for minimized in [true, false] {
         let mut ui = ready_ui();
-        let vault = ui.app.runtime.app.current.clone().unwrap();
+        let vault = ui.app.runtime.app.current.as_deref().unwrap().clone();
         let released = Arc::new(AtomicBool::new(false));
         let commits = Arc::new(AtomicUsize::new(0));
         let repo_release = released.clone();
@@ -1473,9 +1632,8 @@ fn assert_hidden_close_reveals_completed_work_once(committed_warning: bool) {
                     gate: GatedRepository {
                         released: repo_release.clone(),
                         commits: repo_commits.clone(),
-                        fail_commit: false,
+                        fail_commit: Default::default(),
                     },
-                    committed_warning,
                     cleanup_required: false,
                 }),
                 Some(vault.clone()),
@@ -1484,11 +1642,9 @@ fn assert_hidden_close_reveals_completed_work_once(committed_warning: bool) {
         drain_memory_app(&mut ui.app.runtime.app);
         let candidate = candidate_with_new_group(&ui);
         ui.app.runtime.app.commit(candidate, false).unwrap();
-        if !committed_warning {
-            wait_hidden(&mut ui, minimized);
-            assert!(ui.app.runtime.app.has_pending());
-            ui.app.runtime.app.retry_cleanup().unwrap();
-        }
+        wait_hidden(&mut ui, minimized);
+        assert!(ui.app.runtime.app.has_pending());
+        ui.app.runtime.app.retry_cleanup().unwrap();
 
         // The raw Close occurs while saving/cleaning, before its result exists.
         let commands = hidden_frame(&mut ui, minimized, true);
@@ -1502,17 +1658,11 @@ fn assert_hidden_close_reveals_completed_work_once(committed_warning: bool) {
             assert!(!commands.contains(&egui::ViewportCommand::Close));
             let app = &ui.app.runtime.app;
             if !app.saving && !app.cleaning {
-                assert_eq!(app.has_pending(), !committed_warning);
-                assert_eq!(app.warning.is_some(), committed_warning);
-                assert_eq!(app.repository_state.cleanup_required, committed_warning);
-                assert_eq!(
-                    app.current.as_ref().unwrap().revision,
-                    u64::from(committed_warning)
-                );
-                assert_eq!(
-                    app.current.as_ref().unwrap().groups.len(),
-                    1 + usize::from(committed_warning)
-                );
+                assert!(app.has_pending());
+                assert!(app.warning.is_none());
+                assert!(!app.repository_state.cleanup_required);
+                assert_eq!(app.current.as_deref().unwrap().revision, 0);
+                assert_eq!(app.current.as_deref().unwrap().groups.len(), 1);
                 assert!(commands.contains(&egui::ViewportCommand::CancelClose));
                 assert!(commands.contains(&egui::ViewportCommand::Minimized(false)));
                 assert!(commands.contains(&egui::ViewportCommand::Visible(true)));
@@ -1542,21 +1692,11 @@ fn assert_hidden_close_reveals_completed_work_once(committed_warning: bool) {
 }
 
 #[test]
-fn hidden_close_reveals_committed_cleanup_warning_once() {
-    assert_hidden_close_reveals_completed_work_once(true);
-}
-
-#[test]
-fn hidden_close_reveals_successful_cleanup_with_pending_candidate_once() {
-    assert_hidden_close_reveals_completed_work_once(false);
-}
-
-#[test]
 fn window_movement_resizing_zoom_and_close_never_commit() {
     let mut ui = ready_ui_with_authenticator();
     let gate = gated_repository(&mut ui);
     gate.release();
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     for (size, origin, native_dpi, zoom) in [
         (Vec2::new(400.0, 892.0), Pos2::new(150.0, 90.0), 1.0, 1.0),
         (
@@ -1573,104 +1713,61 @@ fn window_movement_resizing_zoom_and_close_never_commit() {
             physical_frame(&mut ui, size, origin, native_dpi, false);
         }
         assert!(!ui.app.runtime.app.saving && !ui.app.runtime.app.has_pending());
-        assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
+        assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
         assert_eq!(ui.app.model.snapshot(), original);
         assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
     }
+
+    let id = ui.app.model.entries[0].id;
+    ui.app.edit(&ui.ctx, Some(id));
+    let commands = hidden_frame(&mut ui, true, true);
+    assert!(commands.contains(&egui::ViewportCommand::CancelClose));
+    assert!(commands.contains(&egui::ViewportCommand::Minimized(false)));
+    assert!(commands.contains(&egui::ViewportCommand::Visible(true)));
+    assert!(commands.contains(&egui::ViewportCommand::Focus));
+    assert!(!ui.app.runtime.close_requested);
+    assert!(matches!(ui.app.dialog, Some(Dialog::Edit { .. })));
+    visible_frame(&mut ui, NORMAL_SIZE, false);
+    let close = ui.point("×");
+    click_visible(&mut ui, close);
+    assert!(ui.app.dialog.is_none());
+    assert!(!ui.app.runtime.close_requested);
+
     let commands = hidden_frame(&mut ui, true, true);
     assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
     assert!(!ui.app.runtime.close_blocked());
     assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
-}
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
 
-#[test]
-fn moving_then_editing_saves_once_without_a_followup_window_commit() {
-    let mut ui = ready_ui_with_authenticator();
-    let gate = gated_repository(&mut ui);
-    gate.release();
-    let original = ui.app.runtime.app.current.clone().unwrap();
-    let id = ui.app.model.entries[0].id;
-    ui.app.edit(&ui.ctx, Some(id));
-    for _ in 0..4 {
-        interactive_frame(&mut ui, Vec::new());
+    let open_read_only_dialogs: [fn(&mut GroupUi); 3] = [
+        |ui| ui.app.open_dialog(&ui.ctx, Dialog::Info),
+        |ui| {
+            ui.app.open_dialog(
+                &ui.ctx,
+                Dialog::details(&ui.app.model, &ui.app.model.entries[0]),
+            );
+        },
+        |ui| ui.app.open_full_backup(&ui.ctx),
+    ];
+    for open_dialog in open_read_only_dialogs {
+        let mut ui = ready_ui_with_authenticator();
+        let gate = gated_repository(&mut ui);
+        gate.release();
+        let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
+        open_dialog(&mut ui);
+        assert!(ui.app.dialog.is_some());
+        let commands = visible_frame(&mut ui, NORMAL_SIZE, true);
+        assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
+        assert!(ui.app.runtime.close_requested);
+        assert_eq!(gate.commits.load(Ordering::Relaxed), 0);
+        assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
     }
-    let text = *ui.points(&original.authenticators[0].name).last().unwrap();
-    click_visible(&mut ui, text);
-    let ctrl = egui::Modifiers {
-        ctrl: true,
-        command: true,
-        ..Default::default()
-    };
-    interactive_frame(
-        &mut ui,
-        vec![
-            egui::Event::ModifiersChanged(ctrl),
-            egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: Some(egui::Key::A),
-                pressed: true,
-                repeat: false,
-                modifiers: ctrl,
-            },
-            egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: Some(egui::Key::A),
-                pressed: false,
-                repeat: false,
-                modifiers: ctrl,
-            },
-            egui::Event::Paste("移動後立即套用".into()),
-            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
-        ],
-    );
-    let moved_to = Pos2::new(150.0, 90.0);
-    interactive_frame_at(&mut ui, moved_to, Vec::new());
-    let apply = ui.point("套用");
-    for pressed in [true, false] {
-        interactive_frame_at(
-            &mut ui,
-            moved_to,
-            vec![
-                egui::Event::PointerMoved(apply),
-                egui::Event::PointerButton {
-                    pos: apply,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-    }
-    assert!(ui.app.dialog.is_none());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while ui.app.runtime.app.saving {
-        assert!(Instant::now() < deadline);
-        visible_frame_at(&mut ui, NORMAL_SIZE, moved_to, false);
-        std::thread::yield_now();
-    }
-    let saved = ui.app.runtime.app.current.clone().unwrap();
-    let mut expected = original;
-    expected.revision += 1;
-    expected.authenticators[0].name = "移動後立即套用".into();
-    expected.authenticators[0].updated_at_ms = saved.authenticators[0].updated_at_ms;
-    assert_eq!(saved, expected);
-    // Follow-up frames and closing must not submit another data commit.
-    for _ in 0..4 {
-        visible_frame_at(&mut ui, NORMAL_SIZE, moved_to, false);
-    }
-    assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
-    let commands = visible_frame_at(&mut ui, NORMAL_SIZE, moved_to, true);
-    assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
-    assert_eq!(ui.app.model.snapshot(), expected);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&expected));
-    assert_eq!(gate.commits.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn loading_hidden_and_loaded_frames_do_not_reposition_or_write() {
     let mut ui = ready_ui();
-    let original = ui.app.runtime.app.current.clone().unwrap();
+    let original = ui.app.runtime.app.current.as_deref().unwrap().clone();
     let vault = original.clone();
     let released = Arc::new(AtomicBool::new(false));
     let commits = Arc::new(AtomicUsize::new(0));
@@ -1687,7 +1784,7 @@ fn loading_hidden_and_loaded_frames_do_not_reposition_or_write() {
             Box::new(GatedRepository {
                 released: Arc::new(AtomicBool::new(true)),
                 commits: factory_commits.clone(),
-                fail_commit: false,
+                fail_commit: Default::default(),
             }),
             Some(vault.clone()),
         ))
@@ -1725,7 +1822,7 @@ fn loading_hidden_and_loaded_frames_do_not_reposition_or_write() {
         egui::ViewportCommand::OuterPosition(_) | egui::ViewportCommand::InnerSize(_)
     )));
     assert_eq!(ui.app.runtime.app.phase, bnauth_app::Phase::Ready);
-    assert_eq!(ui.app.runtime.app.current.as_ref(), Some(&original));
+    assert_eq!(ui.app.runtime.app.current.as_deref(), Some(&original));
     assert_eq!(ui.app.model.snapshot(), original);
     assert!(!ui.app.runtime.app.saving && !ui.app.runtime.app.has_pending());
     assert_eq!(gate.commits.load(Ordering::Relaxed), 0);

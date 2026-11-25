@@ -1,159 +1,145 @@
 use super::*;
-use crate::runtime::ClockStorageContext;
+use crate::runtime::SYNCING_NOTICE;
 use bnauth_core::clock::{ClockObservation, RuntimeClock};
 
 impl BnAuthApp {
     pub(super) fn reload_with_clock_cancel(&mut self) -> Result<(), String> {
         self.runtime.app.reload()?;
-        let context = self.runtime.clock_storage_context();
-        self.observe_shared_clock(ClockObservation::now(), &context);
+        self.observe_shared_clock(ClockObservation::now());
         self.cancel_clock_work();
         Ok(())
     }
 
-    pub(super) fn observe_shared_clock(
-        &mut self,
-        observation: ClockObservation,
-        context: &ClockStorageContext,
-    ) {
+    pub(super) fn observe_shared_clock(&mut self, observation: ClockObservation) {
         let runtime = &mut self.runtime;
         runtime.frame_time = runtime.clock.observe(observation);
-        if runtime.clock.take_invalidation() {
-            runtime.note_clock_invalidation_from(runtime.clock.is_synced(), context);
-        }
     }
 
     /// An explicit reload abandons clock work tied to the previous open vault.
     /// Call after queuing the reload, so a rejected reload preserves pending work.
     pub(super) fn cancel_clock_work(&mut self) {
+        if self.runtime.sync_manual {
+            self.notifications.clear_status_if(SYNCING_NOTICE);
+        }
         let runtime = &mut self.runtime;
-        runtime.pending_clock_record = None;
-        runtime.clock_save_inflight = None;
-        runtime.pending_clock_invalidation = false;
-        runtime.clock_invalidation_inflight = false;
+        runtime.clear_pending_clock_save();
         runtime.sync_rx = None;
         runtime.sync_manual = false;
-        runtime.pending_clock_manual = false;
-        runtime.clock_save_manual = false;
+        runtime.pending_clock_merge = false;
         runtime.clock_notices = crate::runtime::ClockStatusNotices::default();
     }
 
-    /// Opening or restoring a complete working vault selects its shared clock.
+    /// Check the running clock before returning to the saved calibration.
     pub(super) fn load_shared_clock(&mut self) {
-        let context = self.runtime.clock_storage_context();
-        self.load_shared_clock_observed(ClockObservation::now(), &context);
+        let observation = ClockObservation::now();
+        self.observe_shared_clock(observation);
+        self.rebase_shared_clock(observation, false);
     }
 
-    pub(super) fn load_shared_clock_observed(
+    /// Reuse the reading that was already checked against the previous clock.
+    pub(super) fn rebase_shared_clock(
         &mut self,
         observation: ClockObservation,
-        context: &ClockStorageContext,
+        preserve_manual_clock: bool,
     ) {
-        self.observe_shared_clock(observation, context);
-        self.cancel_clock_work();
+        let runtime = &mut self.runtime;
+        if preserve_manual_clock
+            && runtime.pending_clock_manual
+            && runtime.pending_clock_record.is_some()
+        {
+            // The restore ACK already consumed any sample included in that save.
+            // A later sample is still live and can be saved against the new vault.
+            return;
+        }
+        if preserve_manual_clock && runtime.sync_manual {
+            runtime.clear_pending_clock_save();
+        } else {
+            self.cancel_clock_work();
+        }
         let runtime = &mut self.runtime;
         let saved = runtime
             .app
             .current
             .as_ref()
             .and_then(|snapshot| snapshot.service_time_sync.battlenet.as_ref());
-        let known_invalid =
-            saved.is_some_and(|record| runtime.invalidated_clock_records.contains(record));
-        let record = if known_invalid { None } else { saved };
-        runtime.pending_clock_invalidation = known_invalid;
-        match RuntimeClock::from_saved_observation(record, observation) {
-            Ok(clock) => runtime.clock = clock,
+        match RuntimeClock::from_saved_observation(saved, observation) {
+            Ok(mut clock) => {
+                runtime.frame_time = clock.observe(observation);
+                runtime.clock = clock;
+            }
             Err(error) => {
                 runtime.clock = RuntimeClock::new();
-                runtime
-                    .clock
-                    .note_failure(format!("無法套用已保存校時：{error}"));
+                runtime.clock.note_failure(error);
+                runtime.frame_time = runtime.clock.now_ms();
             }
         }
-        self.otp_cache.clear();
     }
 
     /// A calibration waits for acknowledged data; it never writes an old draft.
     pub(super) fn save_shared_clock_if_ready(&mut self) {
         let runtime = &mut self.runtime;
-        if runtime.allow_close_with_residue
-            || runtime.app.phase != bnauth_app::Phase::Ready
+        if runtime.app.phase != bnauth_app::Phase::Ready
             || runtime.app.saving
             || runtime.app.cleaning
             || runtime.app.has_pending()
             || runtime.app.warning.is_some()
-            || runtime.app.repository_state.needs_attention()
-            || runtime.export_rx.is_some()
-            || runtime.group_import_rx.is_some()
-            || runtime.full_restore_rx.is_some()
-            || (self.dialog.is_some() && !runtime.close_requested)
+            || !runtime.app.repository_state.allows_writes()
+            || runtime.file_job_in_progress()
+            || if runtime.close_requested {
+                runtime.recovery.in_progress()
+            } else {
+                self.dialog.is_some()
+            }
         {
             return;
         }
-        if !runtime.pending_clock_invalidation && runtime.pending_clock_record.is_none() {
-            return;
-        }
-        let Some(current) = &runtime.app.current else {
+        let (Some(record), Some(current)) = (
+            runtime.pending_clock_record.as_ref(),
+            runtime.app.current.as_deref(),
+        ) else {
             return;
         };
-        let invalidation = runtime.pending_clock_invalidation;
-        let record = if invalidation {
-            None
-        } else {
-            runtime.pending_clock_record.clone()
-        };
-        if current.service_time_sync.battlenet == record {
-            let manual = runtime.pending_clock_manual;
-            runtime.pending_clock_record = None;
-            runtime.clock_save_inflight = None;
-            runtime.pending_clock_invalidation = false;
-            runtime.clock_invalidation_inflight = false;
-            runtime.pending_clock_manual = false;
-            runtime.clock_save_manual = false;
-            if manual {
-                self.notify("校時成功並已保存");
-            }
+        if current.service_time_sync.battlenet.as_ref() == Some(record) {
+            runtime.clear_pending_clock_save();
             return;
         }
-        let mut candidate = current.clone();
-        candidate.service_time_sync.battlenet = record.clone();
-        match runtime.app.commit(candidate, false) {
+        let candidate = current.with_battlenet_clock(Some(record.clone()));
+        match runtime.app.commit_edit(false, || candidate) {
             Ok(()) => {
-                runtime.clock_save_inflight = record;
-                runtime.clock_invalidation_inflight = invalidation;
+                runtime.clock_save_inflight = Some(record.clone());
                 runtime.clock_save_manual = runtime.pending_clock_manual;
             }
             Err(error) => {
                 runtime.app.error = Some(error.clone());
                 if runtime.pending_clock_manual {
-                    self.warn(format!("校時結果尚未保存：{error}"));
+                    self.warn(error);
                 }
             }
         }
     }
 
     pub(super) fn discard_unsaved_changes(&mut self) {
-        let observation = ClockObservation::now();
-        let context = self.runtime.clock_storage_context();
-        self.observe_shared_clock(observation, &context);
-        let clock_write = self.runtime.clock_save_inflight.is_some();
-        let invalidation_write = self.runtime.clock_invalidation_inflight;
+        let clock_write =
+            !self.runtime.pending_clock_merge && self.runtime.clock_save_inflight.is_some();
+        if !clock_write {
+            self.observe_shared_clock(ClockObservation::now());
+        }
         self.runtime.app.discard();
-        if !self.runtime.app.has_pending() {
-            if let Some(snapshot) = &self.runtime.app.current {
-                self.model.apply_snapshot(snapshot);
-                self.otp_cache.clear();
-            }
-            if clock_write {
-                // Discard does not replace current or the runtime in-flight
-                // marker; the standalone loader can capture that context again.
-                self.load_shared_clock();
-            }
-            if invalidation_write {
-                self.runtime.pending_clock_invalidation = false;
-                self.runtime.clock_invalidation_inflight = false;
-                self.warn("校時失效狀態未保存；下次開啟請先重新校時。".to_owned());
-            }
+        if self.runtime.app.has_pending() {
+            return;
+        }
+        self.runtime.pending_import = None;
+        self.runtime.pending_groups = None;
+        self.runtime.pending_full_restore = false;
+        if std::mem::take(&mut self.runtime.pending_clock_merge) {
+            self.runtime.clock_save_inflight = None;
+            self.runtime.clock_save_manual = false;
+        }
+        if let Some(edit) = self.runtime.pending_list_edit.take() {
+            self.rollback_list_edit(edit);
+        }
+        if clock_write {
+            self.load_shared_clock();
         }
     }
 }

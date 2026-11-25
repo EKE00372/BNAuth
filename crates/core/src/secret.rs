@@ -5,7 +5,7 @@ use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
 /// A fixed Battle.net seed. Debug never reveals bytes, and owned memory is cleared on drop.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Secret([u8; 20]);
 
 impl Secret {
@@ -28,19 +28,23 @@ impl Secret {
         &self.0
     }
 
-    /// Explicitly exposes hex for the native serializer; never use in logging.
+    /// Explicitly exposes hex for the user; never use in logging.
     pub fn hex(&self) -> String {
+        self.with_hex(str::to_owned)
+    }
+
+    fn with_hex<T>(&self, use_hex: impl FnOnce(&str) -> T) -> T {
         const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut value = String::with_capacity(40);
-        for byte in self.0 {
-            value.push(DIGITS[(byte >> 4) as usize] as char);
-            value.push(DIGITS[(byte & 15) as usize] as char);
+        let mut value = Zeroizing::new([0_u8; 40]);
+        for (pair, &byte) in value.chunks_exact_mut(2).zip(&self.0) {
+            pair[0] = DIGITS[(byte >> 4) as usize];
+            pair[1] = DIGITS[(byte & 15) as usize];
         }
-        value
+        use_hex(std::str::from_utf8(&value[..]).expect("hex digits are ASCII"))
     }
 }
 
-fn nibble(value: u8) -> Result<u8, String> {
+pub(crate) fn nibble(value: u8) -> Result<u8, String> {
     match value {
         b'0'..=b'9' => Ok(value - b'0'),
         b'a'..=b'f' => Ok(value - b'a' + 10),
@@ -61,8 +65,7 @@ impl fmt::Debug for Secret {
 }
 impl Serialize for Secret {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let value = Zeroizing::new(self.hex());
-        serializer.serialize_str(&value)
+        self.with_hex(|value| serializer.serialize_str(value))
     }
 }
 impl<'de> Deserialize<'de> for Secret {
@@ -71,7 +74,7 @@ impl<'de> Deserialize<'de> for Secret {
         impl<'de> de::Visitor<'de> for SecretVisitor {
             type Value = Secret;
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a 40-character hexadecimal seed")
+                formatter.write_str("驗證器必須有40位十六進位密鑰")
             }
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Secret, E> {
                 Secret::from_hex(value).map_err(E::custom)

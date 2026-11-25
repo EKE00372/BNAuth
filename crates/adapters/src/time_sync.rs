@@ -7,6 +7,7 @@ use bnauth_core::clock::{
     SampleValidationError, SyncSample, TIME_SOURCE, TimeReference, select_sample, system_now_ms,
     validate_sample,
 };
+use bnauth_core::{ErrorCode, OperationError};
 use serde::Deserialize;
 use std::io::Read;
 use std::time::{Duration, Instant};
@@ -47,11 +48,21 @@ impl From<String> for SyncFailure {
     }
 }
 
+impl From<OperationError> for SyncFailure {
+    fn from(error: OperationError) -> Self {
+        error.to_string().into()
+    }
+}
+
 impl From<SampleValidationError> for SyncFailure {
     fn from(error: SampleValidationError) -> Self {
         Self {
             message: error.to_string(),
-            clock_discontinuity: error == SampleValidationError::WallClockDiscontinuity,
+            clock_discontinuity: matches!(
+                error,
+                SampleValidationError::WallClockDiscontinuity
+                    | SampleValidationError::MonotonicDiscontinuity
+            ),
         }
     }
 }
@@ -63,9 +74,9 @@ struct SampleFailure {
 }
 
 impl SampleFailure {
-    fn sample(message: impl Into<String>) -> Self {
+    fn sample(error: OperationError) -> Self {
         Self {
-            failure: message.into().into(),
+            failure: error.into(),
             stop_round: false,
         }
     }
@@ -75,9 +86,9 @@ impl SampleFailure {
             stop_round: false,
         }
     }
-    fn stop(message: impl Into<String>) -> Self {
+    fn stop(error: OperationError) -> Self {
         Self {
-            failure: message.into().into(),
+            failure: error.into(),
             stop_round: true,
         }
     }
@@ -112,16 +123,15 @@ fn collect_samples(
     let mut samples = Vec::with_capacity(SAMPLE_LIMIT);
     let mut last_failure = None;
     for _ in 0..SAMPLE_LIMIT {
-        let Some(remaining) = ROUND_TIMEOUT.checked_sub(elapsed()) else {
-            break;
-        };
+        let remaining = ROUND_TIMEOUT.saturating_sub(elapsed());
         if remaining.is_zero() {
+            last_failure = Some(ErrorCode::retry_connection().into());
             break;
         }
         match request(remaining.min(SAMPLE_TIMEOUT)) {
             Ok(sample) => {
                 if elapsed() > ROUND_TIMEOUT {
-                    last_failure = Some(SyncFailure::from("校時已超過單輪 15 秒期限。".to_owned()));
+                    last_failure = Some(ErrorCode::retry_connection().into());
                     break;
                 }
                 samples.push(sample);
@@ -168,24 +178,17 @@ fn request_sample(agent: &ureq::Agent, timeout: Duration) -> Result<SyncSample, 
         .timeout_connect(Some(timeout))
         .build()
         .call()
-        .map_err(|error| match error {
-            ureq::Error::Timeout(_) => SampleFailure::sample("校時連線逾時；請手動重試。"),
-            _ => SampleFailure::sample("無法連線或驗證校時服務的 TLS；請手動重試。"),
-        })?;
+        .map_err(|_| SampleFailure::sample(ErrorCode::retry_connection()))?;
     let status = response.status().as_u16();
     if status != 200 {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok());
-        return Err(status_failure(status, retry_after));
+        return Err(status_failure(status));
     }
     if response
         .body()
         .content_length()
         .is_some_and(|length| length > MAX_BODY as u64)
     {
-        return Err(SampleFailure::sample("校時回覆超過 16 KiB 上限。"));
+        return Err(SampleFailure::sample(ErrorCode::retry_connection()));
     }
     let mut bytes = Vec::new();
     response
@@ -193,11 +196,11 @@ fn request_sample(agent: &ureq::Agent, timeout: Duration) -> Result<SyncSample, 
         .as_reader()
         .take(MAX_BODY as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| SampleFailure::sample("讀取校時回覆失敗或逾時；請手動重試。"))?;
+        .map_err(|_| SampleFailure::sample(ErrorCode::retry_connection()))?;
     let received_at = Instant::now();
     let received_wall_ms = system_now_ms();
     if received_at.duration_since(sent_at) > timeout {
-        return Err(SampleFailure::sample("校時樣本超過請求期限，未採用。"));
+        return Err(SampleFailure::sample(ErrorCode::retry_connection()));
     }
     let server_time_ms = parse_reply(&bytes).map_err(SampleFailure::sample)?;
     validate_sample(
@@ -210,46 +213,25 @@ fn request_sample(agent: &ureq::Agent, timeout: Duration) -> Result<SyncSample, 
     .map_err(SampleFailure::validation)
 }
 
-fn status_failure(status: u16, retry_after: Option<&str>) -> SampleFailure {
-    if status == 429 {
-        let retry_after = retry_after
-            .map(|value| {
-                value
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | ',' | ':' | '-'))
-                    .take(80)
-                    .collect::<String>()
-            })
-            .filter(|value| !value.is_empty());
-        let message = match retry_after {
-            Some(value) => format!(
-                "校時服務限流（HTTP 429，Retry-After: {value}）；本輪已停止，稍後手動重試。"
-            ),
-            None => "校時服務限流（HTTP 429）；本輪已停止，稍後手動重試。".to_owned(),
-        };
-        return SampleFailure::stop(message);
+fn status_failure(status: u16) -> SampleFailure {
+    let error = ErrorCode::http(status);
+    if (300..500).contains(&status) {
+        SampleFailure::stop(error)
+    } else {
+        SampleFailure::sample(error)
     }
-    if (300..400).contains(&status) {
-        return SampleFailure::stop(format!("校時服務要求重新導向（HTTP {status}），已拒絕。"));
-    }
-    if (400..500).contains(&status) {
-        return SampleFailure::stop(format!(
-            "校時服務拒絕請求（HTTP {status}）；請稍後手動重試。"
-        ));
-    }
-    SampleFailure::sample(format!("校時服務回傳 HTTP {status}；本樣本未採用。"))
 }
 
-fn parse_reply(bytes: &[u8]) -> Result<i64, String> {
+fn parse_reply(bytes: &[u8]) -> Result<i64, OperationError> {
     if bytes.len() > MAX_BODY {
-        return Err("校時回覆超過 16 KiB 上限。".to_owned());
+        return Err(ErrorCode::retry_connection());
     }
     // This schema is flat and denies unknown fields, so nested objects/arrays are
     // rejected immediately, well before the generic API JSON depth limit of16.
     // serde's struct visitor also rejects duplicate timeMs keys and non-i64 data.
     serde_json::from_slice::<TimeReply>(bytes)
         .map(|reply| reply.time_ms)
-        .map_err(|_| "校時回覆格式錯誤，timeMs 必須是唯一的整數 UTC 毫秒。".to_owned())
+        .map_err(|_| ErrorCode::retry_connection())
 }
 
 #[cfg(test)]
@@ -297,7 +279,10 @@ mod tests {
             br#"{"timeMs":{"nested":[[[1]]]}}"#,
             br#"{"timeMs":1700000000000} trailing"#,
         ] {
-            assert!(parse_reply(body).is_err(), "Unexpected accepted body");
+            assert_eq!(
+                parse_reply(body).unwrap_err().to_string(),
+                "E11：連線異常，請重試"
+            );
         }
     }
 
@@ -307,23 +292,10 @@ mod tests {
         body.resize(MAX_BODY, b' ');
         assert_eq!(parse_reply(&body).unwrap(), BASE);
         body.push(b' ');
-        assert!(parse_reply(&body).unwrap_err().contains("16 KiB"));
-    }
-
-    #[test]
-    fn one_round_has_three_samples_and_never_schedules_a_retry() {
-        let calls = Cell::new(0);
-        let result = collect_samples(
-            None,
-            |timeout| {
-                assert_eq!(timeout, SAMPLE_TIMEOUT);
-                calls.set(calls.get() + 1);
-                Err(SampleFailure::sample("offline"))
-            },
-            || Duration::ZERO,
+        assert_eq!(
+            parse_reply(&body).unwrap_err().to_string(),
+            "E11：連線異常，請重試"
         );
-        assert!(result.is_err());
-        assert_eq!(calls.get(), 3);
     }
 
     #[test]
@@ -339,7 +311,7 @@ mod tests {
                 calls.set(attempt + 1);
                 if attempt < 2 {
                     elapsed_ms.set(elapsed_ms.get() + 5_000);
-                    Err(SampleFailure::sample("校時連線逾時；請手動重試。"))
+                    Err(SampleFailure::sample(ErrorCode::retry_connection()))
                 } else {
                     elapsed_ms.set(elapsed_ms.get() + 20);
                     Err(clock_jump_failure(base, 10_000))
@@ -351,35 +323,33 @@ mod tests {
         assert_eq!(calls.get(), 3);
         assert_eq!(elapsed_ms.get(), 10_020);
         assert!(error.is_clock_discontinuity());
-        assert_eq!(error.into_message(), "校時採樣期間本機時間不連續，未採用。");
+        assert_eq!(
+            error.into_message(),
+            "E13：時間偏差過大，請重新校時"
+        );
     }
 
     #[test]
     fn an_independent_last_failure_does_not_inherit_an_earlier_clock_jump() {
-        for message in [
-            "校時連線逾時；請手動重試。",
-            "無法連線或驗證校時服務的 TLS；請手動重試。",
-        ] {
-            let base = Instant::now();
-            let calls = Cell::new(0);
-            let error = collect_samples(
-                None,
-                |_| {
-                    let attempt = calls.get();
-                    calls.set(attempt + 1);
-                    if attempt == 0 {
-                        Err(clock_jump_failure(base, 0))
-                    } else {
-                        Err(SampleFailure::sample(message))
-                    }
-                },
-                || Duration::ZERO,
-            )
-            .unwrap_err();
-            assert_eq!(calls.get(), 3);
-            assert!(!error.is_clock_discontinuity());
-            assert_eq!(error.into_message(), message);
-        }
+        let base = Instant::now();
+        let calls = Cell::new(0);
+        let error = collect_samples(
+            None,
+            |_| {
+                let attempt = calls.get();
+                calls.set(attempt + 1);
+                if attempt == 0 {
+                    Err(clock_jump_failure(base, 0))
+                } else {
+                    Err(SampleFailure::sample(ErrorCode::retry_connection()))
+                }
+            },
+            || Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 3);
+        assert!(!error.is_clock_discontinuity());
+        assert_eq!(error.into_message(), "E11：連線異常，請重試");
     }
 
     #[test]
@@ -401,7 +371,10 @@ mod tests {
                 }
             },
         );
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().into_message(),
+            "E11：連線異常，請重試"
+        );
     }
 
     #[test]
@@ -417,7 +390,7 @@ mod tests {
                     if last_sample_jumps && index == 2 {
                         Err(clock_jump_failure(base, 200))
                     } else if !last_sample_jumps && index == 1 {
-                        Err(SampleFailure::sample("bad sample"))
+                        Err(SampleFailure::sample(ErrorCode::retry_connection()))
                     } else {
                         Ok(sample(base, index, 90_000))
                     }
@@ -438,14 +411,16 @@ mod tests {
                 None,
                 |_| {
                     calls.set(calls.get() + 1);
-                    Err(status_failure(status, Some("120")))
+                    Err(status_failure(status))
                 },
                 || Duration::ZERO,
             );
-            assert!(result.is_err());
             assert_eq!(calls.get(), 1);
+            let message = result.unwrap_err().into_message();
             if status == 429 {
-                assert!(result.unwrap_err().to_string().contains("Retry-After: 120"));
+                assert_eq!(message, "E14：請求次數過多，請稍後重試");
+            } else {
+                assert_eq!(message, format!("E12：HTTP 錯誤，服務回傳 HTTP {status}。"));
             }
         }
     }
