@@ -1,13 +1,13 @@
 [package]
 name = "bnauth-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 description = "BNAuth domain model, manual import and Battle.net TOTP"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.8"
 hmac = "=0.12.1"
