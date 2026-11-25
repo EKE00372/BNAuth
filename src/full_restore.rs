@@ -103,9 +103,10 @@ impl BnAuthApp {
                 if let Some(Dialog::FullRestore(form)) = &mut self.dialog {
                     form.loaded = None;
                     form.confirmed = false;
-                    form.error.clone_from(&error);
+                    form.error = error;
+                } else {
+                    self.warn(error);
                 }
-                self.warn(error);
             }
         }
     }

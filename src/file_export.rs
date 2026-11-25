@@ -374,13 +374,10 @@ impl BnAuthApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 }
                 if let Some(Dialog::Export(form)) = &mut self.dialog {
-                    if error == ErrorCode::DiskFull.notice().to_string() {
-                        form.error = error;
-                        return;
-                    }
-                    form.error.clone_from(&error);
+                    form.error = error;
+                } else {
+                    self.warn(error);
                 }
-                self.warn(error);
             }
         }
     }

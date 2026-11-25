@@ -140,9 +140,10 @@ impl BnAuthApp {
             Err(error) => {
                 if let Some(Dialog::GroupImport(form)) = &mut self.dialog {
                     form.loaded = None;
-                    form.error.clone_from(&error);
+                    form.error = error;
+                } else {
+                    self.warn(error);
                 }
-                self.warn(error);
             }
         }
     }
