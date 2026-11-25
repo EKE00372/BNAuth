@@ -212,10 +212,8 @@ pub fn write_with_cleanup<B: AsRef<[u8]>>(
             temporary.verify(bytes)
         })();
         result.map_err(write_error)?;
-        // Keep the same guarded handle through installation and final readback.
+        // On Windows, rename the already verified file through the same guarded handle.
         temporary.install(path).map_err(write_error)?;
-        #[cfg(windows)]
-        temporary.verify(bytes).map_err(write_error)?;
         // Resolving the selected path again could follow a retargeted junction.
         #[cfg(windows)]
         let installed = temporary.installed_path();
@@ -322,8 +320,7 @@ impl ExportTemporary {
             drop(self.file.take());
             fs::rename(&self.path, path)?;
         }
-        // Disarm cleanup immediately after the successful rename. A later
-        // readback failure must never delete the installed destination.
+        // Disarm temporary cleanup as soon as the destination is installed.
         self.installed = true;
         Ok(())
     }

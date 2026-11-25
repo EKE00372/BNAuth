@@ -48,11 +48,6 @@ impl AcknowledgedPrimary {
     }
 }
 
-enum PrimaryCheck {
-    Identity,
-    Fingerprint,
-}
-
 #[derive(Clone, Debug)]
 struct OwnedFile {
     path: PathBuf,
@@ -391,7 +386,7 @@ impl Repository {
         revision: u64,
     ) -> Result<CommitOutcome, String> {
         // The existing primary stays locked against writes and replacement while staging.
-        self.check_current(PrimaryCheck::Identity)?;
+        self.check_primary_path()?;
         let mut next = candidate.file_view();
         next.revision = revision;
         let encoded = native::encode_validated(&next)?;
@@ -465,7 +460,8 @@ impl Repository {
                 return Err(ErrorCode::WriteFailed.notice().to_string());
             }
             self.inject(FaultPoint::AfterStage)?;
-            self.check_current(PrimaryCheck::Fingerprint)?;
+            // The guard keeps the acknowledged bytes stable while rechecking the path.
+            self.check_primary_path()?;
             self.inject(FaultPoint::BeforeReplace)?;
             Ok(())
         })();
@@ -674,15 +670,10 @@ impl Repository {
         Ok(())
     }
 
-    fn check_current(&self, check: PrimaryCheck) -> Result<(), String> {
+    fn check_primary_path(&self) -> Result<(), String> {
         self.check_current_directory()?;
         let matches = match (self.current, platform::open_guarded(&self.path, false)?) {
-            (Some(expected), Some(mut file)) => match check {
-                PrimaryCheck::Identity => {
-                    platform::file_identity(&file)? == expected.stamp.identity
-                }
-                PrimaryCheck::Fingerprint => stamp_open(&mut file)? == expected.stamp,
-            },
+            (Some(expected), Some(file)) => platform::file_identity(&file)? == expected.stamp.identity,
             (None, None) => true,
             (None, Some(_)) => {
                 return Err("資料檔已由其他程式建立，已停止保存；請重新開啟 BNAuth。".into());
