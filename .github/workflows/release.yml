@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本號，例如 0.3.0 或 v0.3.0，須與 Cargo.toml 相同'
+        description: '版本號，例如 0.4.0 或 v0.4.0，須與 Cargo.toml 相同'
         required: true
         type: string
 
